@@ -1,0 +1,19 @@
+{
+  "name": "mcp-dev",
+  "version": "0.1.0",
+  "description": "Local CLI agent for calling registered MCP servers",
+  "type": "module",
+  "bin": {
+    "mcp-dev": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "@inquirer/prompts": "^7.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "commander": "^12.1.0",
+    "inquirer": "^12.0.0"
+  }
+}
