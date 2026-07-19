@@ -31,16 +31,52 @@ function getDefaultEnvironment() {
   return env;
 }
 
-function resolveEnvironment(entry) {
+// Env var interpolation (new): a registered env value of exactly
+// "${VAR_NAME}" is replaced with process.env.VAR_NAME at connect time, so
+// a secret never has to be written into servers.json -- only the *name*
+// of the shell env var holding it does. Values NOT matching this exact
+// pattern pass through unchanged, so existing literal-value configs keep
+// working with no migration [derived: backward-compatible by
+// construction, since the regex only matches the full-string
+// "${IDENT}" shape].
+//
+// Fails closed: a referenced var that is unset throws, rather than
+// silently passing an empty string to the spawned server. An empty
+// API-key env var is a worse failure mode than a loud one -- it looks to
+// the downstream server like a present-but-empty credential instead of a
+// config error the user sees immediately, and could surface as a
+// confusing 401 three layers away instead of here.
+//
+// Scope note: this does not encrypt or otherwise protect servers.json
+// itself -- entries that still hold literal secrets are exactly as
+// exposed as before. It only makes the *non*-literal form available so a
+// user who wants secrets out of that file has a documented way to do it.
+const ENV_REF_RE = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+
+export function interpolateEnv(env, serverName) {
+  const resolved = {};
+  for (const [key, rawValue] of Object.entries(env ?? {})) {
+    const m = ENV_REF_RE.exec(rawValue);
+    if (!m) { resolved[key] = rawValue; continue; }
+    const varName = m[1];
+    if (process.env[varName] === undefined) {
+      throw new Error(`Server "${serverName}": env var "${key}" references \${${varName}}, which is not set in your shell.`);
+    }
+    resolved[key] = process.env[varName];
+  }
+  return resolved;
+}
+
+function resolveEnvironment(entry, serverName) {
   return {
     ...getDefaultEnvironment(),
     ...(entry.inheritEnv ? process.env : {}),
-    ...(entry.env ?? {}),
+    ...interpolateEnv(entry.env, serverName),
   };
 }
 
 export async function connectServer(name, entry) {
-  const client = new Client({ name: "mcp-agent-cli", version: "0.1.0" }, { capabilities: {} });
+  const client = new Client({ name: "mcp-dev-cli", version: "0.1.0" }, { capabilities: {} });
 
   let transport;
   if (entry.url) {
@@ -50,7 +86,7 @@ export async function connectServer(name, entry) {
     transport = new StdioClientTransport({
       command,
       args,
-      env: resolveEnvironment(entry),
+      env: resolveEnvironment(entry, name),
       cwd: entry.cwd ?? undefined,
       stderr: "pipe",
     });

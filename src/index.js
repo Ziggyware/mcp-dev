@@ -8,7 +8,7 @@ import { startSession } from "./session.js";
 import { colors, style } from "./colors.js";
 
 const program = new Command();
-program.name("mcp-agent").description("Local CLI agent for calling your registered MCP servers").version("0.1.0");
+program.name("mcp-dev").description("Local CLI agent for calling your registered MCP servers").version("0.1.0");
 
 // Wraps a command action so any thrown error (e.g. connectServer failing
 // after earlier servers in the same command already connected) still closes
@@ -115,13 +115,13 @@ program
   .description("Call a tool, with prompts guiding you through its parameters")
   .action(withCleanup(async (server, toolName) => {
     const entry = getServer(server);
-    if (!entry) return fail(`No server named "${server}". Run \`mcp-agent list\`.`);
+    if (!entry) return fail(`No server named "${server}". Run \`mcp-dev list\`.`);
     const client = await connectServer(server, entry);
     const tools = await listTools(client);
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {
       await closeAllClients();
-      return fail(`No tool "${toolName}" on "${server}". Run \`mcp-agent tools ${server}\`.`);
+      return fail(`No tool "${toolName}" on "${server}". Run \`mcp-dev tools ${server}\`.`);
     }
 
     const args = await promptForArgs(tool.inputSchema);
@@ -142,7 +142,7 @@ program
   .option("-s, --server <name>", "restrict to one registered server")
   .action(withCleanup(async (queryParts, opts) => {
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return fail("Set ANTHROPIC_API_KEY to use `ask`. Use `mcp-agent call` for schema-guided prompts without it.");
+    if (!apiKey) return fail("Set ANTHROPIC_API_KEY to use `ask`. Use `mcp-dev call` for schema-guided prompts without it.");
 
     const query = queryParts.join(" ");
     const servers = opts.server ? { [opts.server]: getServer(opts.server) } : listServers();

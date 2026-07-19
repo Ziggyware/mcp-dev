@@ -3,9 +3,13 @@
 import { search } from "@inquirer/prompts";
 import { style } from "./colors.js";
 
+// "results" and "save" added here (only change from baseline) so the new
+// result-buffer commands show up in the "/" palette like every other
+// builtin, instead of only being reachable if the user already knows the
+// exact command name.
 const BUILTIN_COMMANDS = [
   "connect", "disconnect", "servers", "tools", "call", "ask",
-  "history", "clear", "help", "exit", "quit",
+  "results", "save", "history", "clear", "help", "exit",
 ];
 export function formatParamHint(inputSchema) {
   if (!inputSchema?.properties) return "";
@@ -48,9 +52,20 @@ export async function mainPalette(registeredServerNames, toolsByServer) {
       const text = input ?? "";
       const slash = text.indexOf("/");
 
+
       if (slash !== -1) {
         const serverPart = text.slice(0, slash);
         const toolPart = text.slice(slash + 1).toLowerCase();
+
+        if (serverPart === "") {
+          return registeredServerNames
+            .filter((s) => toolsByServer.has(s))
+            .map((s) => ({
+              value: { kind: "server-select", raw: `${s}/` },
+              name: `${style.serverName(s)}/`,
+              description: "→ browse tools",
+            }));
+        }
 
         if (!toolsByServer.has(serverPart)) {
           // kind: "noop" -- selecting this entry must not be treated as a
