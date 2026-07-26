@@ -314,8 +314,10 @@ This routing is not a general-purpose shell-injection-safe quoting layer — arg
 ## Development
 
 ```bash
-npm link          # develop against the global `mcp-dev` command
-npm unlink -g      # remove when done
+npm link                       # develop against the global `mcp-dev` command
+npm unlink -g                  # remove when done
+node ./src/index.js            #executes the app
+node ./src/index.js session    #executes the app in session mode
 ```
 
 There is no bundler or build step — `src/index.js` runs directly via its `#!/usr/bin/env node` shebang (POSIX) or the `.cmd` shim `npm link` generates (Windows).
