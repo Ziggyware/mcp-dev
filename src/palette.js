@@ -3,14 +3,11 @@
 import { search } from "@inquirer/prompts";
 import { style } from "./colors.js";
 
-// "results" and "save" added here (only change from baseline) so the new
-// result-buffer commands show up in the "/" palette like every other
-// builtin, instead of only being reachable if the user already knows the
-// exact command name.
 const BUILTIN_COMMANDS = [
   "connect", "disconnect", "servers", "tools", "call", "ask",
   "results", "save", "history", "clear", "help", "exit",
 ];
+
 export function formatParamHint(inputSchema) {
   if (!inputSchema?.properties) return "";
   const required = new Set(inputSchema.required ?? []);
@@ -23,17 +20,6 @@ export function formatParamHint(inputSchema) {
   return parts.join(", ");
 }
 
-// toolsByServer: Map<serverName, Array<tool>> from toolCache (object-shaped,
-// per the earlier fix to session.js's tool discovery). registeredServerNames:
-// every registered server, connected or not.
-//
-// source is invoked on every keystroke (including the initial empty-string
-// call on prompt entry), which is what makes the list appear the instant "/"
-// is pressed rather than requiring Enter first.
-//
-// No "/" in the typed text -> builtins + server-select entries, filtered by
-// whatever's been typed. A "/" present -> drill into that server's tools,
-// filtered by whatever follows the "/".
 export async function mainPalette(registeredServerNames, toolsByServer) {
   const builtinEntries = BUILTIN_COMMANDS.map((c) => ({
     value: { kind: "builtin", raw: c },
@@ -52,7 +38,6 @@ export async function mainPalette(registeredServerNames, toolsByServer) {
       const text = input ?? "";
       const slash = text.indexOf("/");
 
-
       if (slash !== -1) {
         const serverPart = text.slice(0, slash);
         const toolPart = text.slice(slash + 1).toLowerCase();
@@ -68,9 +53,6 @@ export async function mainPalette(registeredServerNames, toolsByServer) {
         }
 
         if (!toolsByServer.has(serverPart)) {
-          // kind: "noop" -- selecting this entry must not be treated as a
-          // chat message. session.js's loop checks for "noop" and just
-          // continues.
           return [{
             value: { kind: "noop" },
             name: style.warning(`"${serverPart}" not connected or not yet discovered — check with /servers`),
@@ -97,9 +79,8 @@ export async function mainPalette(registeredServerNames, toolsByServer) {
           }));
       }
 
-      // No "/": builtins + server-select entries, filtered by typed text.
       const needle = text.toLowerCase();
-      return [...builtinEntries, ...serverEntries].filter((e) =>
+      return [...serverEntries,...builtinEntries].filter((e) =>
         !needle || e.name.toLowerCase().includes(needle)
       );
     },
@@ -108,18 +89,14 @@ export async function mainPalette(registeredServerNames, toolsByServer) {
   return selection;
 }
 
-// Level 1: built-ins + server names, shown immediately -- source fires on
-// prompt entry with input="" before any keystroke, which is what makes this
-// appear "on pressing /" rather than "on pressing / then Enter". Selecting a
-// server name (not a built-in) routes to level 2 rather than executing.
 async function paletteLevel1(registeredServerNames) {
   const entries = [
-    ...BUILTIN_COMMANDS.map((c) => ({ value: { kind: "builtin", name: c }, name: c })),
     ...registeredServerNames.map((s) => ({
       value: { kind: "server", name: s },
       name: `${style.serverName(s)}/`,
       description: "select to browse this server's tools",
     })),
+    ...BUILTIN_COMMANDS.map((c) => ({ value: { kind: "builtin", name: c }, name: c })),
   ];
   return search({
     message: "/",
@@ -131,9 +108,6 @@ async function paletteLevel1(registeredServerNames) {
   });
 }
 
-// Level 2: one server's tools, with param hints inline. Only reached after
-// explicitly selecting a server at level 1 -- this is what makes "/ then
-// select an mcp service" produce the MCP command list, distinct from level 1.
 async function paletteLevel2(serverName, tools) {
   const entries = tools.map((t) => ({
     value: { server: serverName, tool: t.name, schema: t.inputSchema },
@@ -187,6 +161,6 @@ async function showCommandPalette(toolsByServer) {
     },
   });
 
-  return selected; // { server, tool, schema }
+  return selected;
 }
 export { paletteLevel1, paletteLevel2, showCommandPalette, BUILTIN_COMMANDS };

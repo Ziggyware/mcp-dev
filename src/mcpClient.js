@@ -1,12 +1,27 @@
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { CreateMessageRequestSchema, ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { routeChat } from "./router.js";
 
 const activeClients = new Set();
-// Session-only: maps server name -> live client, so a REPL session can reuse
-// a connection across multiple commands instead of reconnecting each time.
-// One-shot CLI commands (tools/call/ask) don't touch this map.
 const sessionClients = new Map();
+
+function winCliQuote(arg) {
+  let result = String(arg).replace(/(\\*)"/g, '$1$1\\"');
+  result = result.replace(/(\\+)$/, "$1$1");
+  return `"${result}"`;
+}
+
+function cmdMetaEscape(quotedArg) {
+  return quotedArg.replace(/[()%!^<>&|;,]/g, "^$&");
+}
+
+function buildWindowsCommandLine(command, args) {
+  return [command, ...args].map((a) => cmdMetaEscape(winCliQuote(a))).join(" ");
+}
 
 function resolveWindowsCommand(command, args) {
   if (process.platform !== "win32") return { command, args };
@@ -14,7 +29,7 @@ function resolveWindowsCommand(command, args) {
   const hasExplicitExt = /\.(exe|cmd|bat|com)$/i.test(command);
   if (hasPathSeparator || hasExplicitExt) return { command, args };
   const comspec = process.env.ComSpec || process.env.COMSPEC || "cmd.exe";
-  return { command: comspec, args: ["/d", "/s", "/c", command, ...args] };
+  return { command: comspec, args: ["/d", "/s", "/c", buildWindowsCommandLine(command, args)] };
 }
 
 const DEFAULT_ENV_ALLOWLIST = [
@@ -31,26 +46,6 @@ function getDefaultEnvironment() {
   return env;
 }
 
-// Env var interpolation (new): a registered env value of exactly
-// "${VAR_NAME}" is replaced with process.env.VAR_NAME at connect time, so
-// a secret never has to be written into servers.json -- only the *name*
-// of the shell env var holding it does. Values NOT matching this exact
-// pattern pass through unchanged, so existing literal-value configs keep
-// working with no migration [derived: backward-compatible by
-// construction, since the regex only matches the full-string
-// "${IDENT}" shape].
-//
-// Fails closed: a referenced var that is unset throws, rather than
-// silently passing an empty string to the spawned server. An empty
-// API-key env var is a worse failure mode than a loud one -- it looks to
-// the downstream server like a present-but-empty credential instead of a
-// config error the user sees immediately, and could surface as a
-// confusing 401 three layers away instead of here.
-//
-// Scope note: this does not encrypt or otherwise protect servers.json
-// itself -- entries that still hold literal secrets are exactly as
-// exposed as before. It only makes the *non*-literal form available so a
-// user who wants secrets out of that file has a documented way to do it.
 const ENV_REF_RE = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
 
 export function interpolateEnv(env, serverName) {
@@ -75,8 +70,44 @@ function resolveEnvironment(entry, serverName) {
   };
 }
 
+function installSamplingHandler(client) {
+  client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    const { messages: samplingMessages, systemPrompt, maxTokens } = request.params;
+
+    const chatMessages = [
+      ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+      ...samplingMessages.map((m) => ({
+        role: m.role,
+        content: m.content.type === "text" ? m.content.text : JSON.stringify(m.content),
+      })),
+    ];
+
+    const { message, model } = await routeChat(chatMessages, []);
+
+    return {
+      model,
+      role: "assistant",
+      stopReason: "endTurn",
+      content: { type: "text", text: typeof message.content === "string" ? message.content : JSON.stringify(message.content) },
+    };
+  });
+}
+
+function installRootsHandler(client, name, entry) {
+  client.setRequestHandler(ListRootsRequestSchema, async () => {
+    const rootPath = path.resolve(entry.root ?? entry.cwd ?? process.cwd());
+    return { roots: [{ uri: pathToFileURL(rootPath).href, name }] };
+  });
+}
+
 export async function connectServer(name, entry) {
-  const client = new Client({ name: "mcp-dev-cli", version: "0.1.0" }, { capabilities: {} });
+  const client = new Client(
+    { name: "mcp-dev-cli", version: "0.1.0" },
+    { capabilities: { sampling: {}, roots: { listChanged: true } } }
+  );
+
+  installSamplingHandler(client);
+  installRootsHandler(client, name, entry);
 
   let transport;
   if (entry.url) {
@@ -102,12 +133,33 @@ export async function connectServer(name, entry) {
   return client;
 }
 
-// Connects on first call, returns the cached live client on every subsequent
-// call for the same name. This is what makes repeated commands inside a
-// session reuse one connection instead of respawning the server each time.
+const TRANSIENT_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN"]);
+
+export function isTransientError(err) {
+  if (err && TRANSIENT_ERROR_CODES.has(err.code)) return true;
+  if (err && TRANSIENT_ERROR_CODES.has(err.cause?.code)) return true;
+  return /socket hang up|network|fetch failed/i.test(err?.message ?? "");
+}
+
+export async function connectServerWithRetry(name, entry, { retries = 3, baseDelayMs = 300 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await connectServer(name, entry);
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientError(err) || attempt === retries) throw err;
+      const backoff = baseDelayMs * 2 ** attempt;
+      const jittered = backoff * (0.5 + Math.random() * 0.5);
+      await new Promise((resolve) => setTimeout(resolve, jittered));
+    }
+  }
+  throw lastErr;
+}
+
 export async function getOrConnectServer(name, entry) {
   if (sessionClients.has(name)) return sessionClients.get(name);
-  const client = await connectServer(name, entry);
+  const client = await connectServerWithRetry(name, entry);
   sessionClients.set(name, client);
   return client;
 }
@@ -126,16 +178,96 @@ export function listConnected() {
 }
 
 export async function listTools(client) {
-  const res = await client.listTools();
-  return res.tools;
+  const allTools = [];
+  let cursor;
+  do {
+    const res = await client.listTools(cursor ? { cursor } : undefined);
+    allTools.push(...res.tools);
+    cursor = res.nextCursor;
+  } while (cursor);
+
+  // Server-declared order across paginated listTools() calls isn't
+  // guaranteed stable — depends entirely on server-side iteration order
+  // (reflection order, dictionary order, whatever the server backend uses).
+  // Sort once here so every consumer (palette search, `tools` command,
+  // session tool cache) sees deterministic alphabetical order without each
+  // needing its own sort.
+  allTools.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+
+  return allTools;
 }
 
-export async function callTool(client, toolName, args) {
-  return client.callTool({ name: toolName, arguments: args });
+export async function callTool(client, toolName, args, options = {}) {
+  return client.callTool({ name: toolName, arguments: args }, undefined, options);
+}
+
+export async function callToolResilient(name, entry, toolName, args, options = {}) {
+  const client = await getOrConnectServer(name, entry);
+  try {
+    return await callTool(client, toolName, args, options);
+  } catch (err) {
+    if (options.signal?.aborted || !isTransientError(err)) throw err;
+    await disconnectServer(name);
+    const fresh = await connectServerWithRetry(name, entry);
+    sessionClients.set(name, fresh);
+    activeClients.add(fresh);
+    return await callTool(fresh, toolName, args, options);
+  }
+}
+
+export function withCancellation(fn) {
+  return async (...args) => {
+    const controller = new AbortController();
+    const onSigint = () => controller.abort(new Error("Cancelled by user (SIGINT)"));
+    process.once("SIGINT", onSigint);
+    try {
+      return await fn(controller.signal, ...args);
+    } finally {
+      process.removeListener("SIGINT", onSigint);
+    }
+  };
+}
+
+export function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+export async function closeClient(client) {
+  await client.close();
+  activeClients.delete(client);
 }
 
 export async function closeAllClients() {
   await Promise.allSettled([...activeClients].map((c) => c.close()));
   activeClients.clear();
   sessionClients.clear();
+}
+
+// Improvement 7: stderr capture surfaced on connect failure. StdioClientTransport
+// is spawned with stderr: "pipe" (already the case) but nothing previously
+// read that stream -- a server crashing on startup produced only "connect
+// ECONNRESET"-style transport errors with the server's own diagnostic
+// output (its actual crash reason) silently discarded. This attaches a
+// bounded ring buffer to each stdio transport's stderr and exposes it via
+// getLastStderr, called from index.js/session.js error paths.
+const stderrBuffers = new WeakMap();
+const MAX_STDERR_BYTES = 4096;
+
+export function captureStderr(transport) {
+  if (!transport?.stderr) return;
+  let buf = "";
+  transport.stderr.on("data", (chunk) => {
+    buf += chunk.toString("utf8");
+    if (buf.length > MAX_STDERR_BYTES) buf = buf.slice(buf.length - MAX_STDERR_BYTES);
+  });
+  stderrBuffers.set(transport, () => buf);
+}
+
+export function getLastStderr(transport) {
+  const getter = stderrBuffers.get(transport);
+  return getter ? getter() : "";
 }

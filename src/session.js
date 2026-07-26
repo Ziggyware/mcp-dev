@@ -1,52 +1,63 @@
-// src/session.js — FULL FILE, current state, all prior fragments reconciled
+// src/session.js — FULL FILE, current state
+import { ResultBuffer } from "./resultBuffer.js";
 import inquirer from "inquirer";
+import fs from "node:fs";
 import { getServer, listServers } from "./config.js";
-import { getOrConnectServer, disconnectServer, listConnected, listTools, callTool, closeAllClients } from "./mcpClient.js";
+import {
+  getOrConnectServer,
+  disconnectServer,
+  listConnected,
+  listTools,
+  callToolResilient,
+  closeAllClients,
+  withCancellation,
+} from "./mcpClient.js";
 import { promptForArgs, runAgentTurn, CANCELLED } from "./suggest.js";
 import { mainPalette, BUILTIN_COMMANDS, formatParamHint } from "./palette.js";
 import { compressIfNeeded } from "./history.js";
 import { routeChat } from "./router.js";
 import { colors, style } from "./colors.js";
 import { search } from "@inquirer/prompts";
-
-function printResult(result) {
-  const text = (result.content ?? [])
-    .map((b) => (b.type === "text" ? b.text : JSON.stringify(b, null, 2)))
-    .join("\n");
-  console.log(text || JSON.stringify(result, null, 2));
-}
+import { renderResult } from "./render.js";
 
 async function handleChat(text, toolCache, messages, apiKey) {
   messages.push({ role: "user", content: text });
-  const compressed = await compressIfNeeded(messages, routeChat);
+
+  // Improvement 3 (integration): compressIfNeeded now returns a result
+  // object instead of a bare array, since it can fail. Surface the failure
+  // as a visible warning rather than either crashing or silently discarding
+  // an error the user has no way to see.
+  const { messages: compressed, error: compressionError } = await compressIfNeeded(messages, routeChat);
+  if (compressionError) {
+    console.log(style.warning(`(history compression skipped: ${compressionError.message})`));
+  }
   messages.length = 0;
   messages.push(...compressed);
 
-  const flatTools = [...toolCache.entries()].flatMap(([serverName, tools]) =>
-    tools.map((t) => ({ ...t, __server: serverName }))
-  );
+  const flatTools = [...toolCache.entries()]
+    .flatMap(([serverName, tools]) => tools.map((t) => ({ ...t, __server: serverName })))
+    .sort((a, b) => a.__server.localeCompare(b.__server) || a.name.localeCompare(b.name, undefined, { numeric: true }));
 
   const result = await runAgentTurn({
     messages,
     tools: flatTools,
     apiKey,
-    userQuery: null, // pre-pushed above; requires the runAgentTurn edit flagged last turn
+    userQuery: null,
     confirmTool: async (serverName, toolName, args) => {
       console.log(`\n${style.heading("Model wants to call")} ${style.toolName(toolName)} ${style.muted("on")} ${style.serverName(serverName)}:`);
       console.log(style.muted(JSON.stringify(args, null, 2)));
       const { ok } = await inquirer.prompt([{ type: "confirm", name: "ok", message: "Allow?", default: true }]);
       return ok;
     },
-    executeTool: async (serverName, toolName, args) => {
-      const client = await getOrConnectServer(serverName, getServer(serverName));
-      return callTool(client, toolName, args);
-    },
+    executeTool: async (serverName, toolName, args, { signal } = {}) =>
+      callToolResilient(serverName, getServer(serverName), toolName, args, { signal }),
   });
 
-  console.log(`\n${result.text}`);
+  console.log();
+  if (result.text.startsWith("[stopped after")) console.log(style.warning(result.text));
 }
 
-async function dispatchBuiltin(command, toolCache, messages, apiKey) {
+async function dispatchBuiltin(command, toolCache, messages, apiKey, resultBuffer) {
   const registered = listServers();
 
   switch (command) {
@@ -92,9 +103,68 @@ async function dispatchBuiltin(command, toolCache, messages, apiKey) {
       }
       return;
     }
-    case "call":
-      console.log(style.muted("Use the server/tool palette entries directly instead of `call`.")); // still-unresolved redundancy, named two turns ago
+
+    case "call": {
+      const names = Object.keys(registered);
+      if (names.length === 0) { console.log(style.warning("No servers registered.")); return; }
+      const { name } = await inquirer.prompt([{ type: "list", name: "name", message: "Server:", choices: names }]);
+      const entry = registered[name];
+      const client = await getOrConnectServer(name, entry);
+      const tools = toolCache.get(name) ?? await listTools(client);
+      toolCache.set(name, tools);
+      const { toolName } = await inquirer.prompt([
+            { type: "list", name: "toolName", message: "Tool:", choices: tools.map((t) => t.name) },
+          ]);
+      const tool = tools.find((t) => t.name === toolName);
+      const args = await promptForArgs(tool.inputSchema, resultBuffer);
+      if (args === CANCELLED) { console.log(style.warning("Cancelled.")); return; }
+      const result = await withCancellation((signal) => callToolResilient(name, entry, toolName, args, { signal }))();
+      resultBuffer.push({ server: name, tool: toolName, args, mcpResult: result });
+      renderResult(result);
       return;
+    }
+    case "results": {
+      const entries = resultBuffer.list();
+      if (entries.length === 0) {
+        console.log(style.muted("No cached results yet."));
+        return;
+      }
+      for (const e of entries) {
+        const preview = e.text.length > 80 ? e.text.slice(0, 79) + "…" : e.text;
+        console.log(`${style.bold(`#${e.index}`)} ${style.serverName(e.server)}/${style.toolName(e.tool)} ${style.muted(preview.replace(/\n/g, " "))}`);
+      }
+      return;
+    }
+    case "save": {
+      const entries = resultBuffer.list();
+      if (entries.length === 0) {
+        console.log(style.warning("No cached results to save."));
+        return;
+      }
+      const { n, path } = await inquirer.prompt([
+        { type: "number", name: "n", message: "Result # to save:" },
+        { type: "input", name: "path", message: "Save to path:" },
+      ]);
+      const entry = resultBuffer.get(n);
+      if (!entry) { console.log(style.error(`No cached result #${n}.`)); return; }
+      // Improvement 10: overwrite confirmation on `save`. Previously
+      // fs.writeFileSync silently clobbered an existing file at the target
+      // path with no warning -- a typo'd path colliding with an existing
+      // file (e.g. a config or source file) destroyed it with no recovery
+      // path other than external backups.
+      if (fs.existsSync(path)) {
+        const { confirmOverwrite } = await inquirer.prompt([
+          { type: "confirm", name: "confirmOverwrite", message: `"${path}" already exists. Overwrite?`, default: false },
+        ]);
+        if (!confirmOverwrite) {
+          console.log(style.muted("Cancelled."));
+          return;
+        }
+      }
+      fs.writeFileSync(path, entry.text);
+      console.log(style.success(`Saved result #${n} to ${path}.`));
+      return;
+    }
     case "ask": {
       if (!apiKey) { console.error(style.error("No LLM credentials configured.")); return; }
       const { query } = await inquirer.prompt([{ type: "input", name: "query", message: "Ask:" }]);
@@ -123,12 +193,10 @@ export async function startSession() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   const messages = [];
   const toolCache = new Map();
+  const resultBuffer = new ResultBuffer();
 
   console.log(style.heading("mcp-dev session"));
   console.log(style.muted("Press / for commands. Type freely to chat."));
-  // src/session.js — startSession's main loop, wrapping the palette calls
-  // in try/catch to handle search()'s actual throw-on-cancel behavior,
-  // confirmed by your transcript rather than assumed.
 
   while (true) {
     const registered = listServers();
@@ -146,7 +214,7 @@ export async function startSession() {
     try {
       selection = await mainPalette(registeredNames, toolCache);
     } catch (err) {
-      if (err?.name === "ExitPromptError") continue; // Ctrl+C at top level: just re-render
+      if (err?.name === "ExitPromptError") continue;
       throw err;
     }
     if (selection === undefined) continue;
@@ -175,7 +243,7 @@ export async function startSession() {
           },
         });
       } catch (err) {
-        if (err?.name === "ExitPromptError") continue; // Ctrl+C inside server drill: back out to top-level, NOT process exit
+        if (err?.name === "ExitPromptError") continue;
         throw err;
       }
       selection = toolSelection;
@@ -186,14 +254,14 @@ export async function startSession() {
       continue;
     }
     if (selection.kind === "builtin") {
-      await dispatchBuiltin(selection.raw, toolCache, messages, apiKey);
+      await dispatchBuiltin(selection.raw, toolCache, messages, apiKey, resultBuffer);
       continue;
     }
     if (selection.kind === "tool-call") {
       const { server, tool, schema } = selection;
       let args;
       try {
-        args = await promptForArgs(schema);
+        args = await promptForArgs(schema, resultBuffer);
       } catch (err) {
         if (err?.name === "ExitPromptError") { console.log(style.warning("Cancelled.")); continue; }
         throw err;
@@ -202,9 +270,12 @@ export async function startSession() {
         console.log(style.warning("Cancelled — missing required field."));
         continue;
       }
-      const client = await getOrConnectServer(server, registered[server]);
-      const result = await callTool(client, tool, args);
-      printResult(result);
+      const result = await withCancellation((signal) =>
+        callToolResilient(server, registered[server], tool, args, { signal })
+      )();
+
+      resultBuffer.push({ server, tool, args, mcpResult: result });
+      renderResult(result);
       continue;
     }
     if (selection.kind === "noop") continue;

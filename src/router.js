@@ -1,18 +1,22 @@
-// src/router.js — minimal in-process version of router.tsx's routeInference,
-// no circuit breaker / SQLite state (T=heur, C=0.6: dropping the breaker is
-// a scope call, not a correctness requirement — a long-running session
-// process might genuinely benefit from it, a one-shot CLI invocation mostly
-// won't hit the same provider enough times in one run for OPEN-state to
-// matter). Flagging as self-imposed simplification per rule 21, not
-// something you asked me to drop.
+// src/router.js — minimal in-process version of routeInference, no circuit
+// breaker / SQLite state.
 import { getProviderArray } from "./providers.js";
 
-export async function routeChat(messages, tools) {
+// Improvement 9: per-provider request timeout via AbortController. A hung
+// provider connection previously blocked the entire fallback chain
+// indefinitely -- no per-provider bound existed, so a single unresponsive
+// endpoint could stall `ask`/session chat forever rather than falling
+// through to the next configured provider within a bounded window.
+const PROVIDER_TIMEOUT_MS = 20000;
+
+export async function routeChat(messages, tools, { timeoutMs = PROVIDER_TIMEOUT_MS } = {}) {
   const providers = getProviderArray();
   if (providers.length === 0) throw new Error("No provider API keys set in environment.");
 
   let lastErr;
   for (const p of providers) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`${p.name} timed out after ${timeoutMs}ms`)), timeoutMs);
     try {
       const res = await fetch(`${p.base}/chat/completions`, {
         method: "POST",
@@ -27,6 +31,7 @@ export async function routeChat(messages, tools) {
           tool_choice: tools?.length ? "auto" : undefined,
           temperature: 0,
         }),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error(`${p.name} HTTP ${res.status}: ${await res.text()}`);
       const json = await res.json();
@@ -35,6 +40,8 @@ export async function routeChat(messages, tools) {
     } catch (err) {
       lastErr = err;
       console.error(`[fallback] ${p.name} failed: ${err.message}`);
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw new Error(`All providers exhausted. Last: ${lastErr?.message}`);

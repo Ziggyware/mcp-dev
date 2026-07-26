@@ -1,15 +1,27 @@
 import inquirer from "inquirer";
 import { search, editor as editorPrompt } from "@inquirer/prompts";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
 import { style } from "./colors.js";
 import { resolveBackref } from "./resultBuffer.js";
 
-// Sentinel objects (not strings/null) so a legitimate tool result that
-// happens to be null/"" can never be mistaken for cancellation or
-// skip-this-field by identity check. CANCELLED is exported so callers
-// (session.js's loop, promptForArgs itself) can check `=== CANCELLED`.
 export const CANCELLED = Symbol("promptForArgs:cancelled");
 const SKIP = Symbol("promptForArgs:skip");
 const MAX_RETRY = 3;
+
+const ajv = new Ajv({ allErrors: true, strict: false });
+addFormats(ajv);
+const compiledSchemaCache = new Map();
+
+function getValidator(schema) {
+  const key = JSON.stringify(schema);
+  let validate = compiledSchemaCache.get(key);
+  if (!validate) {
+    validate = ajv.compile(schema);
+    compiledSchemaCache.set(key, validate);
+  }
+  return validate;
+}
 
 function coerceScalar(value, schema) {
   if (schema.type === "number" || schema.type === "integer") {
@@ -18,12 +30,6 @@ function coerceScalar(value, schema) {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-// Scalar (string/number/integer) fields. `resultBuffer` is optional --
-// omitted entirely by index.js's one-shot `call` command (no session, no
-// buffer to reference), passed by session.js's tool-call flow. When
-// present, a typed value matching "!!"/"!<n>"/"!<n>.<path>" is resolved
-// against the buffer instead of taken literally; see resultBuffer.js for
-// the collision failure mode (literal args that start with "!").
 async function promptScalarWithBackref(label, schema, isRequired, resultBuffer, attempt = 0) {
   const { value } = await inquirer.prompt([
     {
@@ -36,7 +42,7 @@ async function promptScalarWithBackref(label, schema, isRequired, resultBuffer, 
 
   const trimmed = value.trim();
   if (trimmed === "") return isRequired ? CANCELLED : SKIP;
-
+  let literalOverride;
   if (resultBuffer) {
     const back = resolveBackref(trimmed, resultBuffer);
     if (back.matched) {
@@ -50,21 +56,12 @@ async function promptScalarWithBackref(label, schema, isRequired, resultBuffer, 
       }
       return coerceScalar(back.value, schema);
     }
+    if (back.literal !== undefined) literalOverride = back.literal;
   }
 
-  return coerceScalar(trimmed, schema);
+  return coerceScalar(literalOverride ?? trimmed, schema);
 }
 
-// Object/array fields (new — this is the fix for the README's Known
-// Limitations entry: "promptForArgs has no branch for array- or
-// object-typed schema properties ... falls through to a plain string
-// prompt"). Scope, stated plainly rather than overclaimed: this makes
-// producing valid JSON *easier* (external-editor UX, syntax-error retry,
-// backref/dot-path substitution of a whole previous result) -- it does
-// NOT add field-by-field sub-schema prompting for nested object shapes.
-// A tool with a deeply nested required object still requires the user to
-// write that JSON by hand, just now in a real editor instead of a
-// single-line terminal prompt.
 async function promptJsonField(label, schema, resultBuffer, attempt = 0) {
   const { seed } = await inquirer.prompt([
     {
@@ -75,7 +72,7 @@ async function promptJsonField(label, schema, resultBuffer, attempt = 0) {
   ]);
 
   const trimmed = seed.trim();
-
+  let literalOverride;
   if (trimmed !== "" && resultBuffer) {
     const back = resolveBackref(trimmed, resultBuffer);
     if (back.matched) {
@@ -83,17 +80,17 @@ async function promptJsonField(label, schema, resultBuffer, attempt = 0) {
         console.log(style.error(back.error));
         return promptJsonField(label, schema, resultBuffer, attempt);
       }
-      return back.value; // already a parsed JS value pulled from cached JSON
+      return back.value;
     }
+    if (back.literal !== undefined) literalOverride = back.literal;
   }
 
-  if (trimmed !== "") {
+  const effective = literalOverride ?? trimmed;
+  if (effective !== "") {
     try {
-      return JSON.parse(trimmed);
+      return JSON.parse(effective);
     } catch {
-      // Fall into the editor pre-filled with what they typed, so a typo
-      // gets fixed in place instead of forcing a full restart.
-      return openJsonEditor(label, trimmed, attempt);
+      return openJsonEditor(label, effective, attempt);
     }
   }
 
@@ -103,12 +100,6 @@ async function promptJsonField(label, schema, resultBuffer, attempt = 0) {
   return openJsonEditor(label, skeleton, attempt);
 }
 
-// [unverified — check before relying on this]: exact default-editor
-// resolution order (EDITOR/VISUAL env vars, vi/notepad fallback) is
-// @inquirer/external-editor's behavior, not reimplemented or verified
-// here beyond confirming the "editor" export exists and accepts
-// {message, default, postfix} (checked against the installed package in
-// this session — see the verification note in the accompanying reply).
 async function openJsonEditor(label, seedText, attempt) {
   if (attempt >= MAX_RETRY) {
     console.log(style.warning(`Giving up after ${MAX_RETRY} invalid JSON attempts.`));
@@ -175,40 +166,95 @@ export async function promptForArgs(inputSchema, resultBuffer = null) {
     if (value === SKIP) continue;
     args[key] = value;
   }
+
+  const validate = getValidator(inputSchema);
+  if (!validate(args)) {
+    console.log(style.error("Arguments fail schema validation:"));
+    for (const e of validate.errors) {
+      console.log(style.error(`  ${e.instancePath || "(root)"} ${e.message}`));
+    }
+    return CANCELLED;
+  }
+
   return args;
 }
 
-// Sentinel export retained under its original name/position for anything
-// importing CANCELLED the way the pre-existing code did.
 const MAX_AGENT_STEPS = 8;
 
-// Runs one user turn to completion against a persistent `messages` array
-// (mutated in place -- callers keep this across turns for real memory).
-// Loops: send messages -> if model returns tool_use block(s), confirm each
-// via `confirmTool`, execute via `executeTool`, feed results back as
-// tool_result blocks, repeat -- until the model returns a turn with no
-// tool_use blocks, or MAX_AGENT_STEPS is hit (bounds runaway loops; a model
-// stuck re-calling a tool cannot spin forever).
+async function runStep(toolUses, tools, confirmTool, executeTool) {
+  const decisions = [];
+  for (const use of toolUses) {
+    const sep = use.name.indexOf("__");
+    const server = sep === -1 ? undefined : use.name.slice(0, sep);
+    const bareName = sep === -1 ? use.name : use.name.slice(sep + 2);
+    const matched = tools.find((t) => t.name === bareName && t.__server === server);
+
+    if (!matched) {
+      decisions.push({ use, matched: null, allowed: false, error: `Unknown tool "${use.name}"` });
+      continue;
+    }
+    const allowed = await confirmTool(matched.__server, use.name, use.input);
+    decisions.push({ use, matched, allowed });
+  }
+
+  const controller = new AbortController();
+  const onSigint = () => controller.abort(new Error("Cancelled by user (SIGINT)"));
+  process.once("SIGINT", onSigint);
+
+  let settled;
+  try {
+    settled = await Promise.allSettled(
+      decisions.map(async (d) => {
+        if (d.error) return { tool_use_id: d.use.id, content: `Error: ${d.error}` };
+        if (!d.allowed) return { tool_use_id: d.use.id, content: "User declined to run this tool call." };
+        try {
+          const result = await executeTool(d.matched.__server, d.use.name, d.use.input, { signal: controller.signal });
+          const content = (result.content ?? [])
+            .map((b) => (b.type === "text" ? b.text : JSON.stringify(b)))
+            .join("\n") || JSON.stringify(result);
+          return { tool_use_id: d.use.id, content };
+        } catch (err) {
+          return { tool_use_id: d.use.id, content: `Error: ${err.message}` };
+        }
+      })
+    );
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+  }
+
+  return settled.map((s, i) =>
+    s.status === "fulfilled"
+      ? { type: "tool_result", ...s.value }
+      : { type: "tool_result", tool_use_id: decisions[i].use.id, content: `Error: ${s.reason?.message ?? String(s.reason)}` }
+  );
+}
+
 export async function runAgentTurn({ messages, tools, apiKey, userQuery, confirmTool, executeTool }) {
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
   const anthropic = new Anthropic({ apiKey });
 
-  const toolDefs = tools.map((t) => ({
-    name: t.name,
+  const toolDefs = tools.map((t, i) => ({
+    name: `${t.__server}__${t.name}`,
     description: t.description ?? "",
     input_schema: t.inputSchema ?? { type: "object", properties: {} },
+    ...(i === tools.length - 1 ? { cache_control: { type: "ephemeral" } } : {}),
   }));
 
-  messages.push({ role: "user", content: userQuery });
+  if (userQuery !== null) {
+    messages.push({ role: "user", content: userQuery });
+  }
 
   for (let step = 0; step < MAX_AGENT_STEPS; step++) {
-    const response = await anthropic.messages.create({
+    const stream = anthropic.messages.stream({
       model: "claude-sonnet-4-6",
       max_tokens: 4096,
       tools: toolDefs,
       tool_choice: { type: "auto" },
       messages,
     });
+    stream.on("text", (delta) => process.stdout.write(delta));
+    const response = await stream.finalMessage();
+    if (response.content.some((b) => b.type === "text")) process.stdout.write("\n");
 
     messages.push({ role: "assistant", content: response.content });
 
@@ -218,27 +264,7 @@ export async function runAgentTurn({ messages, tools, apiKey, userQuery, confirm
       return { text, steps: step + 1 };
     }
 
-    const toolResults = [];
-    for (const use of toolUses) {
-      const matched = tools.find((t) => t.name === use.name);
-      let resultContent;
-      try {
-        if (!matched) throw new Error(`Unknown tool "${use.name}"`);
-        const allowed = await confirmTool(matched.__server, use.name, use.input);
-        if (!allowed) {
-          resultContent = "User declined to run this tool call.";
-        } else {
-          const result = await executeTool(matched.__server, use.name, use.input);
-          resultContent = (result.content ?? [])
-            .map((b) => (b.type === "text" ? b.text : JSON.stringify(b)))
-            .join("\n") || JSON.stringify(result);
-        }
-      } catch (err) {
-        resultContent = `Error: ${err.message}`;
-      }
-      toolResults.push({ type: "tool_result", tool_use_id: use.id, content: resultContent });
-    }
-
+    const toolResults = await runStep(toolUses, tools, confirmTool, executeTool);
     messages.push({ role: "user", content: toolResults });
   }
 

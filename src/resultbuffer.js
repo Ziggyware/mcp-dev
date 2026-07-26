@@ -1,46 +1,18 @@
 // src/resultBuffer.js
 //
-// Session-scoped ring buffer of tool-call results, plus a minimal
-// back-reference resolver ("!!" / "!<n>" / "!<n>.<path>") so a value
-// returned by one tool call can be reused as an argument to the next
-// without re-typing or copy-pasting it.
-//
-// Scope note [derived]: this is NOT a general JSONPath/JMESPath engine.
-// Path syntax supports only dot-separated object keys and bracket
-// numeric array indices, e.g. "!3.items[0].id". Wildcards, filters, and
-// slices are unsupported -- unsupported syntax throws a descriptive
-// error rather than silently returning undefined.
-//
-// Persistence [heuristic]: the buffer is in-memory only and cleared on
-// process exit or `clear`. No disk persistence, by design -- a tool
-// result may contain data the user did not ask to have written to disk.
-// `save` in session.js is the explicit, one-entry-at-a-time opt-in for
-// that.
-//
-// Failure mode (disclosed, not fixed): any literal argument value that
-// itself starts with "!" followed by "!" or digits (e.g. a shell command
-// string, a factorial notation, an actual "!123" ticket ID) will be
-// misread as a back-reference instead of taken literally. There is no
-// escape syntax for this in v1 -- if this collides with real argument
-// values in a given server's tool schema, use the array/object JSON
-// editor path instead (see suggest.js), which does not apply backref
-// resolution to nested field values, only to the initial single-line
-// prompt.
+// Session-scoped ring buffer of tool-call results, plus a back-reference
+// resolver ("!!" / "!<n>" / "!<n>.<path>") so a value returned by one tool
+// call can be reused as an argument to the next.
 
 const DEFAULT_CAPACITY = 20;
 
 export class ResultBuffer {
   constructor(capacity = DEFAULT_CAPACITY) {
     this.capacity = capacity;
-    this.entries = []; // { index, server, tool, args, text, mcpResult }
+    this.entries = [];
     this.nextIndex = 1;
   }
 
-  // `mcpResult` is the raw object returned by client.callTool(). `text` is
-  // derived once here (the same join-logic every other result printer in
-  // this codebase used ad hoc) so the renderer, the backref resolver, and
-  // `save` all read one canonical string instead of re-deriving it three
-  // different ways with three chances to drift apart.
   push({ server, tool, args, mcpResult }) {
     const text = (mcpResult.content ?? [])
       .map((b) => (b.type === "text" ? b.text : JSON.stringify(b)))
@@ -68,49 +40,141 @@ export class ResultBuffer {
   }
 }
 
+class PathParseError extends Error {
+  constructor(message, path, position) {
+    super(`${message} at position ${position} in "${path}"`);
+    this.name = "PathParseError";
+  }
+}
+
+class PathParser {
+  constructor(path) {
+    this.path = path;
+    this.pos = 0;
+  }
+
+  peek() {
+    return this.path[this.pos];
+  }
+
+  error(message) {
+    throw new PathParseError(message, this.path, this.pos);
+  }
+
+  atEnd() {
+    return this.pos >= this.path.length;
+  }
+
+  parse() {
+    const segments = [{ type: "key", name: this.parseKey() }];
+    while (!this.atEnd()) {
+      segments.push(this.parseSegment());
+    }
+    return segments;
+  }
+
+  parseSegment() {
+    const c = this.peek();
+    if (c === ".") {
+      this.pos++;
+      return { type: "key", name: this.parseKey() };
+    }
+    if (c === "[") {
+      this.pos++;
+      const seg = this.parseBracketBody();
+      if (this.peek() !== "]") this.error(`expected "]"`);
+      this.pos++;
+      return seg;
+    }
+    this.error(`expected "." or "[", found "${c}"`);
+  }
+
+  parseBracketBody() {
+    if (this.peek() === "*") {
+      this.pos++;
+      return { type: "wildcard" };
+    }
+    const start = this.pos;
+    if (this.peek() === "-") this.pos++;
+    const digitsStart = this.pos;
+    while (!this.atEnd() && /[0-9]/.test(this.peek())) this.pos++;
+    if (this.pos === digitsStart) {
+      this.error("expected a numeric index or \"*\" inside [...]");
+    }
+    return { type: "index", value: Number(this.path.slice(start, this.pos)) };
+  }
+
+  parseKey() {
+    const start = this.pos;
+    while (!this.atEnd() && /[A-Za-z0-9_$]/.test(this.peek())) this.pos++;
+    if (this.pos === start) {
+      this.error("expected an identifier");
+    }
+    return this.path.slice(start, this.pos);
+  }
+}
+
+export function parsePath(path) {
+  const parser = new PathParser(path);
+  const segments = parser.parse();
+  if (!parser.atEnd()) {
+    parser.error("unexpected trailing input");
+  }
+  return segments;
+}
+
+function resolveIndex(arr, i) {
+  return i < 0 ? arr.length + i : i;
+}
+
+function walkSegments(value, segments, segIndex, pathStr) {
+  if (segIndex === segments.length) return value;
+  const seg = segments[segIndex];
+
+  if (value === null || value === undefined) {
+    throw new Error(`Path stopped -- value was ${JSON.stringify(value)} before segment ${segIndex + 1}`);
+  }
+
+  if (seg.type === "wildcard") {
+    if (!Array.isArray(value)) {
+      throw new Error(`"[*]" requires an array, got ${typeof value}`);
+    }
+    return value.map((el) => walkSegments(el, segments, segIndex + 1, pathStr));
+  }
+
+  if (seg.type === "index") {
+    if (!Array.isArray(value)) {
+      throw new Error(`"[${seg.value}]" requires an array, got ${typeof value}`);
+    }
+    const idx = resolveIndex(value, seg.value);
+    if (idx < 0 || idx >= value.length) {
+      throw new Error(`Index ${seg.value} out of range (array length ${value.length})`);
+    }
+    return walkSegments(value[idx], segments, segIndex + 1, pathStr);
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`".${seg.name}" requires an object, got ${Array.isArray(value) ? "array" : typeof value}`);
+  }
+  if (!(seg.name in value)) {
+    throw new Error(`Key "${seg.name}" not found`);
+  }
+  return walkSegments(value[seg.name], segments, segIndex + 1, pathStr);
+}
+
+export function walkPath(value, path) {
+  const segments = parsePath(path);
+  return walkSegments(value, segments, 0, path);
+}
+
 const BACKREF_RE = /^!(?:(!)|(\d+))(?:\.(.+))?$/;
 
-// "items[0].id" -> ["items", "0", "id"]. Brackets are normalized to dots
-// first, then every segment is validated against a plain identifier/digit
-// pattern -- this is what turns genuinely unsupported syntax (wildcards,
-// spaces, filter expressions) into an explicit error instead of a wrong
-// silent result.
-function tokenizePath(path) {
-  const normalized = path.replace(/\[(\d+)\]/g, ".$1");
-  const tokens = normalized.split(".").filter((t) => t.length > 0);
-  for (const t of tokens) {
-    if (!/^[A-Za-z0-9_$]+$/.test(t)) {
-      throw new Error(`Unsupported path segment "${t}" in "${path}" (only dotted keys and [n] indices are supported)`);
-    }
-  }
-  return tokens;
-}
-
-function walkPath(value, tokens) {
-  let cur = value;
-  for (const t of tokens) {
-    if (cur === null || cur === undefined) {
-      throw new Error(`Path stopped at "${t}" -- value was ${JSON.stringify(cur)}`);
-    }
-    if (Array.isArray(cur) && /^\d+$/.test(t)) {
-      cur = cur[Number(t)];
-    } else if (typeof cur === "object") {
-      cur = cur[t];
-    } else {
-      throw new Error(`Cannot index into ${typeof cur} at "${t}"`);
-    }
-  }
-  return cur;
-}
-
-// Returns { matched: false } if `raw` is not backref syntax at all (the
-// common case -- most typed args are literal values, not "!something"),
-// so callers can cheaply fall through to normal handling.
-// Returns { matched: true, value, isString, sourceIndex } on success, or
-// { matched: true, error } if it looks like a backref but resolution
-// failed (unknown index, non-JSON text with a path requested, bad path).
 export function resolveBackref(raw, buffer) {
-  const m = BACKREF_RE.exec(String(raw).trim());
+  const str = String(raw).trim();
+  if (str.startsWith("\\!")) {
+    return { matched: false, literal: str.slice(1) };
+  }
+  const m = BACKREF_RE.exec(str);
   if (!m) return { matched: false };
 
   const [, bang, idxStr, path] = m;
@@ -131,8 +195,7 @@ export function resolveBackref(raw, buffer) {
   }
 
   try {
-    const tokens = tokenizePath(path);
-    const value = walkPath(parsed, tokens);
+    const value = walkPath(parsed, path);
     if (value === undefined) {
       return { matched: true, error: `Path ".${path}" not found in result #${entry.index}.` };
     }
