@@ -31,6 +31,7 @@ import { isInteractive } from "./terminal.js";
 import { ApprovalStore } from "./approvals.js";
 import { runWithSpinner } from "./spinner.js";
 import { InputHistory, runPrompt } from "./inputPrompt.js";
+import { Screen } from "./screen.js";
 import { readSessionInput, pickOne, approveToolCall, helpOverlayLines } from "./sessionPrompt.js";
 import { promptPathValue, displayPath } from "./pathPrompt.js";
 import { colorizeJsonText, formatJsonValue } from "./jsonText.js";
@@ -150,7 +151,9 @@ async function invokeTool({ server, tool, args, ctx }) {
   const index = ctx.resultBuffer.push({ server, tool, args, mcpResult: result });
   const header = `${marks.ok()} ${style.serverName(server)}/${style.toolName(tool)} ${colors.faint(summarizeArgs(args))}`;
   console.log(header);
-  renderResult(result);
+  // Inside the session the transcript scrolls, so the pager would fight the UI;
+  // one-shot `mcp-dev call` keeps using $PAGER.
+  renderResult(result, { pager: !ctx.screen });
   console.log(colors.faint(`  cached as ${style.warning(`#${index}`)} — reuse with ${style.key(`!${index}.field`)} or ${style.key("!!")} · /results lists everything`));
   return result;
 }
@@ -182,7 +185,7 @@ async function openTool({ server, tool, presetArgs = null, ctx }) {
       return;
     }
 
-    const approval = await approveToolCall({ server, tool: definition.name, args, approvals: ctx.approvals });
+    const approval = await approveToolCall({ server, tool: definition.name, args, approvals: ctx.approvals, screen: ctx.screen });
     if (approval.edit) {
       initialArgs = args;
       console.log(colors.faint("Edit the arguments, then approve the call."));
@@ -231,7 +234,7 @@ async function handleChat(text, ctx) {
     apiKey: ctx.apiKey,
     userQuery: null,
     confirmTool: async (server, tool, args) => {
-      const approval = await approveToolCall({ server, tool, args, approvals: ctx.approvals });
+      const approval = await approveToolCall({ server, tool, args, approvals: ctx.approvals, screen: ctx.screen });
       return Boolean(approval.approved);
     },
     executeTool: async (server, tool, args, { signal } = {}) => {
@@ -581,7 +584,8 @@ async function dispatchCommand(route, ctx) {
     }
     case "clear":
       ctx.messages.length = 0;
-      console.log(style.success("Conversation history cleared. Connections and cached results remain."));
+      ctx.screen?.clearTranscript();
+      console.log(style.success("Screen and conversation history cleared. Connections and cached results remain."));
       return;
     case "cd": {
       if (args[0]) {
@@ -676,6 +680,21 @@ async function dispatchCommand(route, ctx) {
       }
       setColorMode(mode);
       console.log(style.success(`Colour mode: ${mode}`));
+      return;
+    }
+    case "mouse": {
+      const wanted = (args[0] ?? "").toLowerCase();
+      if (!["on", "off"].includes(wanted)) {
+        console.log(colors.faint(`Mouse wheel scrolling is ${ctx.screen?.mouse ? "on" : "off"}. Use /mouse on or /mouse off.`));
+        console.log(colors.faint("  When it is on, hold Shift while dragging to select text."));
+        return;
+      }
+      if (!ctx.screen) {
+        console.log(colors.faint("The mouse is only tracked inside a full-screen session."));
+        return;
+      }
+      ctx.screen.setMouse(wanted === "on");
+      console.log(style.success(`Mouse wheel scrolling ${wanted}.`));
       return;
     }
     case "exit":
@@ -782,6 +801,11 @@ export async function startSession({ warm = false } = {}) {
 
   const registered = listServers();
   const history = new InputHistory({ entries: loadHistory() });
+  // The session runs in the alternate buffer with its own scrollable
+  // transcript; everything printed goes through the screen from here on.
+  const screen = new Screen({ input: process.stdin, output: process.stdout });
+  screen.enter();
+  screen.capture();
   const ctx = {
     apiKey: process.env.ANTHROPIC_API_KEY,
     messages: [],
@@ -799,9 +823,11 @@ export async function startSession({ warm = false } = {}) {
   // The palette reads tool metadata by server; the cache Map is the same object
   // under a name that reads better at the call sites.
   ctx.toolsByServer = ctx.toolCache;
+  ctx.screen = screen;
   hydrateCachedTools(registered, ctx);
 
   console.log(greeting(ctx));
+  screen.render();
 
   let lastCancel = 0;
   let shuttingDown = false;
@@ -822,6 +848,9 @@ export async function startSession({ warm = false } = {}) {
       // Best effort: we are on our way out.
     }
     saveHistory(ctx.history);
+    // Leave the screen before the farewell so the message lands in the normal
+    // buffer the user returns to, not in a transcript that is about to vanish.
+    screen.leave();
     console.log(style.success("session closed — all connections stopped"));
     process.exit(0);
   };
@@ -893,6 +922,7 @@ export async function startSession({ warm = false } = {}) {
     for (const unsubscribe of ctx.subscriptions.values()) unsubscribe();
     await closeAllClients();
     saveHistory(ctx.history);
+    screen.leave();
   }
 
   console.log(style.success("session closed — all connections stopped"));

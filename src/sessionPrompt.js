@@ -32,10 +32,14 @@ export function statusLine(ctx) {
 
 export function hintsFor(state, ctx) {
   const text = state.line.text;
-  if (text.startsWith("!")) return ["Enter show value", "Tab complete path", "Esc clear"];
+  // Inside a session the output lives in a scrollable transcript, so the footer
+  // says so instead of leaving the user to guess how to reach past results.
+  const scroll = ctx?.screen ? "PgUp scroll" : null;
+  const finish = ctx?.screen ? "Ctrl+D exit" : "Ctrl+C cancel";
+  if (text.startsWith("!")) return ["Enter show value", "Tab complete path", "Esc clear", scroll].filter(Boolean);
   if (state.search) return ["Enter accept", "Ctrl+R next", "Esc cancel"];
-  if (state.entries.length) return ["Tab complete", "↑/↓ choose", "Enter run", "Ctrl+Enter newline", "? help"];
-  return ["Enter run", "Ctrl+Enter newline", "/ commands", "! cached values", "? help", "Ctrl+C cancel"];
+  if (state.entries.length) return ["Tab complete", "↑/↓ choose", "Enter run", "Ctrl+Enter newline", scroll, "? help"].filter(Boolean);
+  return ["Enter run", "Ctrl+Enter newline", "/ commands", "! cached values", scroll, "? help", finish].filter(Boolean);
 }
 
 /**
@@ -43,15 +47,23 @@ export function hintsFor(state, ctx) {
  * @returns {Promise<{ok:boolean, reason?:string, raw?:string, route?:object}>}
  */
 export async function readSessionInput(ctx) {
+  const screen = ctx.screen ?? null;
+  // The status bar belongs to the screen's top row; the inline fallback keeps
+  // it as the first title line, exactly as before.
+  screen?.setStatus(statusLine(ctx));
   const result = await runPrompt({
-    title: (state) => [statusLine(ctx)].concat(state.line.text ? [] : [colors.faint("  Type a sentence, / for commands, /server/ for tools, ! for cached results")]),
+    screen,
+    title: (state) => {
+      const hint = state.line.text ? [] : [colors.faint("  Type a sentence, / for commands, /server/ for tools, ! for cached results")];
+      return screen ? hint : [statusLine(ctx), ...hint];
+    },
     message: () => marks.arrow(),
     submitKey: "enter",
     allowNewline: true,
     history: ctx.history ?? new InputHistory(),
     menuSize: 6,
     status: null,
-    completions: async (text) => completionsFor(text, ctx),
+    completions: (text) => completionsFor(text, ctx),
     preview: (state) => previewFor(state.line.text, ctx),
     hints: (state) => hintsFor(state, ctx),
     onKey: (event, api) => {
@@ -82,11 +94,13 @@ export async function readSessionInput(ctx) {
 /** Fuzzy picker used by /call, /connect, /tools, and /disconnect. */
 export async function pickOne({ title, message = "❯", items, ctx, allowEmpty = false }) {
   const result = await runPrompt({
+    screen: ctx?.screen ?? undefined,
     title,
     message,
     menuSize: 10,
+    escapeCancels: true,
     status: { text: "↑/↓ choose · Enter select · Esc cancel", tone: "info" },
-    completions: async (input) => ({ items: rankByFuzzy(items, input, { key: (item) => `${item.label} ${item.description ?? ""}` }).map(({ item, indices }) => ({ ...item, indices })) }),
+    completions: (input) => ({ items: rankByFuzzy(items, input, { key: (item) => `${item.label} ${item.description ?? ""}` }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["type to filter", "↑/↓ choose", "Enter select", "Esc cancel"],
     validate: () => true,
   });
@@ -124,6 +138,10 @@ export function helpOverlayLines(ctx, state = {}) {
     ["Ctrl+W, Ctrl+Backspace", "delete the previous word"],
     ["Ctrl+U / Ctrl+K", "delete to start / end of the line · Ctrl+Y restores"],
     ["Ctrl+R", "search history"],
+    ["PgUp / PgDn", "scroll the transcript a page; works even while a call is running"],
+    ["Shift+↑ / Shift+↓", "scroll one line · Ctrl+Home top · Ctrl+End newest output"],
+    ["Mouse wheel", "scroll the transcript (hold Shift to select text) · /mouse toggles"],
+    ["Ctrl+L", "clear the transcript and start the view fresh"],
     ["Esc", "clear the line (Ctrl+Y restores); on an empty line, exit the prompt"],
     ["Ctrl+C", "cancel the line; press twice in a row to leave the session"],
     ["Ctrl+D", "exit the session from an empty line"],
@@ -151,7 +169,7 @@ export function helpOverlayLines(ctx, state = {}) {
  * Approval screen for a tool call. Returns
  * `{approved:boolean, remember?:string, edit?:boolean}`.
  */
-export async function approveToolCall({ server, tool, args, approvals, argSummary = null }) {
+export async function approveToolCall({ server, tool, args, approvals, argSummary = null, screen = undefined }) {
   if (approvals?.isGranted(server, tool)) {
     console.log(colors.muted(`auto-approved by a session grant — ${marks.ok()} ${style.serverName(server)}/${style.toolName(tool)}`));
     return { approved: true, auto: true };
@@ -171,6 +189,7 @@ export async function approveToolCall({ server, tool, args, approvals, argSummar
   if (granted.length) header.push(colors.faint(`  session grants: ${granted.map((entry) => entry.scope).join(", ")}`));
 
   const result = await runPrompt({
+    screen,
     title: header,
     message: () => `${marks.arrow()} ${style.body("run?")}`,
     menuSize: 0,

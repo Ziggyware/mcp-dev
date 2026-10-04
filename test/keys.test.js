@@ -90,12 +90,23 @@ test("bracketed paste arrives as one event and keeps newlines", () => {
   assert.equal(rest[0].text, "half two");
 });
 
-test("marks burst input so a pasted newline is not treated as Enter", () => {
+test("marks a multi-line block as a burst so its newline is not treated as Enter", () => {
   const decoder = createKeyDecoder();
   const events = decoder.push("first line\nsecond line\r");
   const enter = events.find((event) => event.name === "enter");
   assert.ok(enter);
   assert.equal(enter.burst, true);
+});
+
+test("fast typing followed by Enter in one read is still Enter, not a newline", () => {
+  const decoder = createKeyDecoder();
+  const events = decoder.push("abc\r");
+  const enter = events.find((event) => event.name === "enter");
+  assert.ok(enter);
+  assert.equal(enter.burst, false, "a trailing Enter must submit the line");
+  // The characters before it are still one burst of text.
+  const chars = events.filter((event) => event.name === "char");
+  assert.equal(chars.map((event) => event.text).join(""), "abc");
 });
 
 test("decodeModifiers maps xterm modifier parameters", () => {

@@ -88,7 +88,7 @@ export const SESSION_COMMANDS = [
   {
     name: "clear",
     group: "Session",
-    description: "clear the conversation history (connections and cache stay)",
+    description: "clear the screen and conversation history (connections and cache stay)",
     usage: "/clear",
   },
   {
@@ -123,6 +123,12 @@ export const SESSION_COMMANDS = [
     group: "Display",
     description: "switch colours: auto, always, never, or basic",
     usage: "/color <auto|always|never|basic>",
+  },
+  {
+    name: "mouse",
+    group: "Display",
+    description: "toggle mouse-wheel transcript scrolling (off restores text selection)",
+    usage: "/mouse <on|off>",
   },
   {
     name: "keys",

@@ -105,7 +105,7 @@ export async function promptPathValue({
     history,
     menuSize: 8,
     status: { text: `Enter accepts · Tab completes · ~ and relative paths resolve against ${displayPath(baseDir, { baseDir })}`, tone: "info" },
-    completions: async (text) => {
+    completions: (text) => {
       const trimmed = text.trim();
       if (!trimmed) {
         const entries = readDirectory(baseDir) ?? [];
@@ -193,6 +193,7 @@ export async function promptPathValue({
       parts.push(colors.path(displayPath(target, { baseDir, width: Math.max(24, terminalColumns() - 24) })));
       return [parts.join("  ")];
     },
+    escapeCancels: true,
     hints: () => ["Tab complete/open", "↑/↓ browse", "Enter accept", "Esc cancel"],
     validate: (text) => {
       if (!String(text).trim()) return "A path is required.";

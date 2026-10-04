@@ -119,8 +119,9 @@ async function promptEnumField({ key, schema, isRequired, header, footer }) {
     message: () => `${marks.arrow()} ${style.body(key)}`,
     menuSize: 8,
     footer,
+    escapeCancels: true,
     status: { text: "↑/↓ choose · Enter accept · Esc cancel", tone: "info" },
-    completions: async (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
+    completions: (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["↑/↓ choose", "Enter accept", "Shift+Tab back", "Esc cancel"],
     onShiftTab: backHandler,
   });
@@ -138,8 +139,9 @@ async function promptBooleanField({ key, schema, isRequired, header, footer, def
     message: () => `${marks.arrow()} ${style.body(key)}`,
     menuSize: 4,
     footer,
+    escapeCancels: true,
     status: { text: "↑/↓ choose · Enter accept · Esc cancel", tone: "info" },
-    completions: async (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
+    completions: (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["↑/↓ choose", "Enter accept", "Shift+Tab back", "Esc cancel"],
     onShiftTab: backHandler,
   });
@@ -191,7 +193,7 @@ async function promptScalarField({ key, schema, isRequired, resultBuffer, header
     status: resultBuffer?.list().length
       ? { text: `type ! to reuse a cached result (${resultBuffer.list().length} available)`, tone: "info" }
       : null,
-    completions: async (text) => {
+    completions: (text) => {
       const trimmed = String(text ?? "").trim();
       if (!resultBuffer || !trimmed.startsWith("!")) return { items: [] };
       return { items: cachedRefItems(resultBuffer, trimmed) };
@@ -203,6 +205,7 @@ async function promptScalarField({ key, schema, isRequired, resultBuffer, header
       resultBuffer?.list().length ? "! cached values" : "",
       "Esc cancel",
     ].filter(Boolean),
+    escapeCancels: true,
     validate: backrefValidate,
     onKey: (event, api) => {
       if (event.name === "enter" && !api.line.text.trim() && !isRequired) {
