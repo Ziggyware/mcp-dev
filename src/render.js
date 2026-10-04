@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { colors, style } from "./colors.js";
 import { renderMarkdown } from "./markdown.js";
+import { parseCommandArguments } from "./args.js";
+import { clipText, terminalColumns, visibleWidth } from "./terminal.js";
 const MAX_CELL_WIDTH = 40;
 let warnedNoPager = false;
 
@@ -35,24 +37,40 @@ function isFlatObjectArray(value) {
   );
 }
 
-function cellStr(v) {
-  if (v === undefined) return "";
-  if (typeof v === "object") return JSON.stringify(v);
-  const s = String(v);
-  return s.length > MAX_CELL_WIDTH ? s.slice(0, MAX_CELL_WIDTH - 1) + "…" : s;
+function cellStr(value) {
+  if (value === undefined) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function padVisible(value, width) {
+  return value + " ".repeat(Math.max(0, width - visibleWidth(value)));
+}
+
+function fitTableWidths(columns, rows, terminalWidth = terminalColumns()) {
+  const widths = columns.map((column) => Math.min(
+    MAX_CELL_WIDTH,
+    Math.max(6, visibleWidth(column), ...rows.map((row) => visibleWidth(cellStr(row[column]))))
+  ));
+  const available = Math.max(columns.length * 6, terminalWidth - Math.max(0, columns.length - 1) * 2);
+  while (widths.reduce((total, width) => total + width, 0) > available) {
+    const widest = widths.reduce((best, width, index) => width > widths[best] ? index : best, 0);
+    if (widths[widest] <= 6) break;
+    widths[widest]--;
+  }
+  return widths;
 }
 
 function renderTable(rows) {
-  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))];
-  const widths = cols.map((c) => Math.max(c.length, ...rows.map((r) => cellStr(r[c]).length)));
-
-  const line = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join("  ");
-  const out = [
-    style.heading(line(cols)),
-    colors.dim(widths.map((w) => "-".repeat(w)).join("  ")),
-    ...rows.map((r) => line(cols.map((c) => cellStr(r[c])))),
-  ];
-  return out.join("\n");
+  const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  if (!columns.length) return "{}";
+  const widths = fitTableWidths(columns, rows);
+  const line = (cells) => cells.map((cell, index) => padVisible(clipText(cell, widths[index]), widths[index])).join("  ");
+  return [
+    style.heading(line(columns)),
+    colors.dim(widths.map((width) => "-".repeat(width)).join("  ")),
+    ...rows.map((row) => line(columns.map((column) => cellStr(row[column])))),
+  ].join("\n");
 }
 
 function collectUrl(value) {
@@ -211,27 +229,39 @@ function unwrapItems(value) {
 // explicit choice), then less, then more, before giving up.
 function resolvePagerCandidates() {
   const candidates = [];
-  if (process.env.PAGER) candidates.push(process.env.PAGER);
-  candidates.push("less", "more");
-  return [...new Set(candidates)];
+  if (process.env.PAGER) {
+    try {
+      const [command, ...args] = parseCommandArguments(process.env.PAGER);
+      if (command) candidates.push({ command, args });
+    } catch {
+      // An invalid PAGER must not make a tool result undisplayable.
+    }
+  }
+  candidates.push({ command: "less", args: ["-R", "-F"] }, { command: "more", args: [] });
+  const seen = new Set();
+  return candidates.filter((candidate) => {
+    const key = `${candidate.command}\u0000${candidate.args.join("\u0000")}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
-function maybePage(text) {
+function maybePage(text, { page = true } = {}) {
   const rows = process.stdout.rows ?? 24;
   const tooLong = text.split("\n").length > rows - 2;
-  if (!process.stdout.isTTY || !tooLong) {
+  if (!page || !process.stdout.isTTY || !tooLong) {
     console.log(text);
     return;
   }
 
   for (const pager of resolvePagerCandidates()) {
-    const args = pager === "less" ? ["-R", "-F"] : [];
-    const result = spawnSync(pager, args, { input: text, stdio: ["pipe", "inherit", "inherit"] });
+    const result = spawnSync(pager.command, pager.args, { input: text, stdio: ["pipe", "inherit", "inherit"] });
     if (!result.error) return;
   }
 
   if (!warnedNoPager) {
-    console.log(style.muted("(no pager available on PATH -- printing directly)"));
+    console.log(style.muted("(no pager available on PATH — printing directly)"));
     warnedNoPager = true;
   }
   console.log(text);
@@ -243,12 +273,15 @@ export function renderResult(mcpResult, opts = {}) {
     return;
   }
 
-  const text = (mcpResult.content ?? [])
-    .map((b) => (b.type === "text" ? b.text : JSON.stringify(b, null, 2)))
+  const blocks = mcpResult.content ?? [];
+  const text = blocks
+    .map((block) => (block.type === "text" ? block.text : JSON.stringify(block, null, 2)))
     .join("\n");
+  const errorPrefix = mcpResult.isError ? `${style.error("Tool reported an error")}\n` : "";
+  const pageOptions = { page: opts.pager !== false };
 
   if (!text) {
-    console.log(style.muted(JSON.stringify(mcpResult, null, 2)));
+    maybePage(`${errorPrefix}${style.muted(JSON.stringify(mcpResult, null, 2))}`, pageOptions);
     return;
   }
 
@@ -256,27 +289,27 @@ export function renderResult(mcpResult, opts = {}) {
   try {
     parsed = JSON.parse(text);
   } catch {
-    maybePage(text);
+    maybePage(errorPrefix + text, pageOptions);
     return;
   }
 
   const directRender = !Array.isArray(parsed) ? renderItem(parsed) : null;
   if (directRender) {
-    maybePage(directRender);
+    maybePage(errorPrefix + directRender, pageOptions);
     return;
   }
 
   const items = unwrapItems(parsed);
   if (items && items.length > 0) {
     const rendered = items.map(renderItem);
-    if (rendered.every((r) => r !== null)) {
-      maybePage(rendered.join(`\n${colors.dim("─".repeat(40))}\n`));
+    if (rendered.every((item) => item !== null)) {
+      maybePage(errorPrefix + rendered.join(`\n${colors.dim("─".repeat(40))}\n`), pageOptions);
       return;
     }
   }
 
   const fallback = isFlatObjectArray(parsed) ? renderTable(parsed) : colorizeJSON(parsed);
-  maybePage(fallback);
+  maybePage(errorPrefix + fallback, pageOptions);
 }
 
 export {

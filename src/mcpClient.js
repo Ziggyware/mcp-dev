@@ -3,14 +3,24 @@ import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CreateMessageRequestSchema, ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { routeChat } from "./router.js";
+import {
+  CreateMessageRequestSchema,
+  ListRootsRequestSchema,
+  ToolListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { redactUrl } from "./terminal.js";
 
 const activeClients = new Set();
 const sessionClients = new Map();
+const connectingClients = new Map();
+const toolChangeListeners = new WeakMap();
+const stderrBuffers = new WeakMap();
+const MAX_STDERR_BYTES = 4_096;
+const MAX_TOOL_PAGES = 100;
+const MAX_TOOLS = 10_000;
 
 function winCliQuote(arg) {
-  let result = String(arg).replace(/(\\*)"/g, '$1$1\\"');
+  let result = String(arg).replace(/(\\*)"/g, "$1$1\\\"");
   result = result.replace(/(\\+)$/, "$1$1");
   return `"${result}"`;
 }
@@ -20,7 +30,7 @@ function cmdMetaEscape(quotedArg) {
 }
 
 function buildWindowsCommandLine(command, args) {
-  return [command, ...args].map((a) => cmdMetaEscape(winCliQuote(a))).join(" ");
+  return [command, ...args].map((arg) => cmdMetaEscape(winCliQuote(arg))).join(" ");
 }
 
 function resolveWindowsCommand(command, args) {
@@ -36,6 +46,7 @@ const DEFAULT_ENV_ALLOWLIST = [
   "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
   "TEMP", "TMP", "SystemRoot", "windir", "PATHEXT", "ComSpec",
   "PROCESSOR_ARCHITECTURE", "USERNAME", "HOMEDRIVE", "HOMEPATH",
+  "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM",
 ];
 
 function getDefaultEnvironment() {
@@ -48,16 +59,21 @@ function getDefaultEnvironment() {
 
 const ENV_REF_RE = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
 
-export function interpolateEnv(env, serverName) {
+/** Resolve exact ${ENV_NAME} references without interpolating arbitrary text. */
+export function interpolateEnv(values, serverName, label = "env var") {
   const resolved = {};
-  for (const [key, rawValue] of Object.entries(env ?? {})) {
-    const m = ENV_REF_RE.exec(rawValue);
-    if (!m) { resolved[key] = rawValue; continue; }
-    const varName = m[1];
-    if (process.env[varName] === undefined) {
-      throw new Error(`Server "${serverName}": env var "${key}" references \${${varName}}, which is not set in your shell.`);
+  for (const [key, rawValue] of Object.entries(values ?? {})) {
+    const value = String(rawValue);
+    const match = ENV_REF_RE.exec(value);
+    if (!match) {
+      resolved[key] = value;
+      continue;
     }
-    resolved[key] = process.env[varName];
+    const variable = match[1];
+    if (process.env[variable] === undefined) {
+      throw new Error(`Server "${serverName}": ${label} "${key}" references \${${variable}}, which is not set in your shell.`);
+    }
+    resolved[key] = process.env[variable];
   }
   return resolved;
 }
@@ -70,20 +86,26 @@ function resolveEnvironment(entry, serverName) {
   };
 }
 
+function samplingContentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((block) => block?.type === "text" ? block.text : JSON.stringify(block)).join("\n");
+  }
+  return content?.type === "text" ? content.text : JSON.stringify(content);
+}
+
 function installSamplingHandler(client) {
   client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
-    const { messages: samplingMessages, systemPrompt, maxTokens } = request.params;
-
+    const { messages: samplingMessages, systemPrompt } = request.params;
     const chatMessages = [
       ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-      ...samplingMessages.map((m) => ({
-        role: m.role,
-        content: m.content.type === "text" ? m.content.text : JSON.stringify(m.content),
+      ...samplingMessages.map((message) => ({
+        role: message.role,
+        content: samplingContentToText(message.content),
       })),
     ];
-
+    const { routeChat } = await import("./router.js");
     const { message, model } = await routeChat(chatMessages, []);
-
     return {
       model,
       role: "assistant",
@@ -100,100 +122,187 @@ function installRootsHandler(client, name, entry) {
   });
 }
 
-export async function connectServer(name, entry) {
-  const client = new Client(
-    { name: "mcp-dev-cli", version: "0.1.0" },
-    { capabilities: { sampling: {}, roots: { listChanged: true } } }
-  );
+function installToolChangeHandler(client) {
+  const listeners = new Set();
+  toolChangeListeners.set(client, listeners);
+  client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+    for (const listener of listeners) {
+      try { await listener(); } catch { /* A UI listener must not break the protocol client. */ }
+    }
+  });
+}
 
-  installSamplingHandler(client);
-  installRootsHandler(client, name, entry);
+export function onToolsChanged(client, listener) {
+  const listeners = toolChangeListeners.get(client);
+  if (!listeners) return () => {};
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
 
-  let transport;
-  if (entry.url) {
-    transport = new StreamableHTTPClientTransport(new URL(entry.url));
-  } else {
-    const { command, args } = resolveWindowsCommand(entry.command, entry.args ?? []);
-    transport = new StdioClientTransport({
-      command,
-      args,
-      env: resolveEnvironment(entry, name),
-      cwd: entry.cwd ?? undefined,
-      stderr: "pipe",
-    });
+export function captureStderr(transport) {
+  if (!transport?.stderr) return;
+  let buffer = "";
+  transport.stderr.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    if (Buffer.byteLength(buffer) > MAX_STDERR_BYTES) {
+      buffer = buffer.slice(-MAX_STDERR_BYTES);
+    }
+  });
+  stderrBuffers.set(transport, () => buffer);
+}
+
+export function getLastStderr(transport) {
+  return stderrBuffers.get(transport)?.() ?? "";
+}
+
+function connectionError(name, entry, error, transport) {
+  const target = entry.url ? redactUrl(entry.url) : entry.command;
+  const stderr = getLastStderr(transport).trim();
+  const suffix = stderr ? `\nServer stderr:\n${stderr}` : "";
+  return new Error(`Failed to connect to server "${name}" (${target}): ${error.message}${suffix}`, { cause: error });
+}
+
+async function raceWithTimeout(promise, ms, message, onTimeout) {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      Promise.resolve(onTimeout?.())
+        .catch(() => {})
+        .finally(() => reject(new Error(message)));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+export async function connectServer(name, entry, { timeoutMs } = {}) {
+  if (!entry || typeof entry !== "object") {
+    throw new Error(`No configuration found for server "${name}".`);
   }
 
+  const capabilities = { roots: { listChanged: true } };
+  if (entry.allowSampling) capabilities.sampling = {};
+  const client = new Client(
+    { name: "mcp-dev-cli", version: "0.2.0" },
+    { capabilities }
+  );
+  if (entry.allowSampling) installSamplingHandler(client);
+  installRootsHandler(client, name, entry);
+  installToolChangeHandler(client);
+
+  let transport;
   try {
-    await client.connect(transport);
-  } catch (err) {
-    throw new Error(`Failed to connect to server "${name}" (${entry.url ?? entry.command}): ${err.message}`);
+    if (entry.url) {
+      const headers = interpolateEnv(entry.headers, name, "header");
+      transport = new StreamableHTTPClientTransport(new URL(entry.url), {
+        ...(Object.keys(headers).length ? { requestInit: { headers } } : {}),
+      });
+    } else {
+      const { command, args } = resolveWindowsCommand(entry.command, entry.args ?? []);
+      transport = new StdioClientTransport({
+        command,
+        args,
+        env: resolveEnvironment(entry, name),
+        cwd: entry.cwd ?? undefined,
+        stderr: "pipe",
+      });
+      captureStderr(transport);
+    }
+
+    await raceWithTimeout(
+      client.connect(transport),
+      timeoutMs,
+      `connecting to "${name}" timed out after ${timeoutMs}ms`,
+      () => client.close().catch(() => {})
+    );
+  } catch (error) {
+    await client.close().catch(() => {});
+    throw connectionError(name, entry, error, transport);
   }
 
   activeClients.add(client);
   return client;
 }
 
-const TRANSIENT_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN"]);
+const TRANSIENT_ERROR_CODES = new Set(["ECONNRESET", "EPIPE", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"]);
 
-export function isTransientError(err) {
-  if (err && TRANSIENT_ERROR_CODES.has(err.code)) return true;
-  if (err && TRANSIENT_ERROR_CODES.has(err.cause?.code)) return true;
-  return /socket hang up|network|fetch failed/i.test(err?.message ?? "");
+export function isTransientError(error) {
+  if (error && TRANSIENT_ERROR_CODES.has(error.code)) return true;
+  if (error && TRANSIENT_ERROR_CODES.has(error.cause?.code)) return true;
+  return /socket hang up|network|fetch failed|connection.*closed|timed out/i.test(error?.message ?? "");
 }
 
-export async function connectServerWithRetry(name, entry, { retries = 3, baseDelayMs = 300 } = {}) {
-  let lastErr;
+export async function connectServerWithRetry(name, entry, { retries = 2, baseDelayMs = 250, timeoutMs = 8_000 } = {}) {
+  let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await connectServer(name, entry);
-    } catch (err) {
-      lastErr = err;
-      if (!isTransientError(err) || attempt === retries) throw err;
-      const backoff = baseDelayMs * 2 ** attempt;
-      const jittered = backoff * (0.5 + Math.random() * 0.5);
-      await new Promise((resolve) => setTimeout(resolve, jittered));
+      return await connectServer(name, entry, { timeoutMs });
+    } catch (error) {
+      lastError = error;
+      if (!isTransientError(error) || attempt === retries) throw error;
+      // Full jitter avoids several sessions retrying a remote service in lockstep.
+      const maximumDelay = baseDelayMs * (2 ** attempt);
+      const delay = Math.round(Math.random() * maximumDelay);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
-  throw lastErr;
+  throw lastError;
 }
 
-export async function getOrConnectServer(name, entry) {
-  if (sessionClients.has(name)) return sessionClients.get(name);
-  const client = await connectServerWithRetry(name, entry);
-  sessionClients.set(name, client);
-  return client;
+/** One in-flight connection per session server prevents duplicate child processes. */
+export async function getOrConnectServer(name, entry, options = {}) {
+  const existing = sessionClients.get(name);
+  if (existing) return existing;
+  const connecting = connectingClients.get(name);
+  if (connecting) return connecting;
+
+  const pending = connectServerWithRetry(name, entry, options)
+    .then((client) => {
+      sessionClients.set(name, client);
+      return client;
+    })
+    .finally(() => connectingClients.delete(name));
+  connectingClients.set(name, pending);
+  return pending;
 }
 
 export async function disconnectServer(name) {
+  const pending = connectingClients.get(name);
+  if (pending) {
+    try { await pending; } catch { return false; }
+  }
   const client = sessionClients.get(name);
-  if (!client) return false;
+  if (!client) return Boolean(pending);
   await client.close();
   activeClients.delete(client);
+  toolChangeListeners.delete(client);
   sessionClients.delete(name);
   return true;
 }
 
 export function listConnected() {
-  return [...sessionClients.keys()];
+  return [...sessionClients.keys()].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-export async function listTools(client) {
+export async function listTools(client, options = {}) {
   const allTools = [];
+  const seenCursors = new Set();
   let cursor;
+  let pages = 0;
+
   do {
-    const res = await client.listTools(cursor ? { cursor } : undefined);
-    allTools.push(...res.tools);
-    cursor = res.nextCursor;
+    if (++pages > MAX_TOOL_PAGES) throw new Error(`Server returned more than ${MAX_TOOL_PAGES} tool-list pages.`);
+    if (cursor && seenCursors.has(cursor)) throw new Error("Server repeated a tool-list cursor; refusing an infinite pagination loop.");
+    if (cursor) seenCursors.add(cursor);
+
+    const response = await client.listTools(cursor ? { cursor } : undefined, options);
+    if (!Array.isArray(response.tools)) throw new Error("Server returned an invalid tools/list response.");
+    allTools.push(...response.tools);
+    if (allTools.length > MAX_TOOLS) throw new Error(`Server reported more than ${MAX_TOOLS} tools; refusing an unbounded response.`);
+    cursor = response.nextCursor;
   } while (cursor);
 
-  // Server-declared order across paginated listTools() calls isn't
-  // guaranteed stable — depends entirely on server-side iteration order
-  // (reflection order, dictionary order, whatever the server backend uses).
-  // Sort once here so every consumer (palette search, `tools` command,
-  // session tool cache) sees deterministic alphabetical order without each
-  // needing its own sort.
-  allTools.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
-
+  allTools.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true, sensitivity: "base" }));
   return allTools;
 }
 
@@ -202,72 +311,54 @@ export async function callTool(client, toolName, args, options = {}) {
 }
 
 export async function callToolResilient(name, entry, toolName, args, options = {}) {
-  const client = await getOrConnectServer(name, entry);
+  const client = await getOrConnectServer(name, entry, options);
   try {
     return await callTool(client, toolName, args, options);
-  } catch (err) {
-    if (options.signal?.aborted || !isTransientError(err)) throw err;
+  } catch (error) {
+    if (options.signal?.aborted || !isTransientError(error)) throw error;
     await disconnectServer(name);
-    const fresh = await connectServerWithRetry(name, entry);
-    sessionClients.set(name, fresh);
-    activeClients.add(fresh);
-    return await callTool(fresh, toolName, args, options);
+    const fresh = await getOrConnectServer(name, entry, options);
+    return callTool(fresh, toolName, args, options);
   }
 }
 
-export function withCancellation(fn) {
+/** Wrap an MCP operation in Ctrl+C cancellation while keeping other SIGINT handlers intact. */
+export function withCancellation(action, { timeoutMs, timeoutMessage = "Operation" } = {}) {
   return async (...args) => {
     const controller = new AbortController();
     const onSigint = () => controller.abort(new Error("Cancelled by user (SIGINT)"));
+    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => controller.abort(new Error(`${timeoutMessage} timed out after ${timeoutMs}ms`)), timeoutMs)
+      : null;
     process.once("SIGINT", onSigint);
     try {
-      return await fn(controller.signal, ...args);
+      return await action(controller.signal, ...args);
     } finally {
+      if (timer) clearTimeout(timer);
       process.removeListener("SIGINT", onSigint);
     }
   };
 }
 
 export function withTimeout(promise, ms, message) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  return raceWithTimeout(promise, ms, message);
 }
 
 export async function closeClient(client) {
+  if (!client) return;
   await client.close();
   activeClients.delete(client);
+  toolChangeListeners.delete(client);
+  for (const [name, sessionClient] of sessionClients) {
+    if (sessionClient === client) sessionClients.delete(name);
+  }
 }
 
 export async function closeAllClients() {
-  await Promise.allSettled([...activeClients].map((c) => c.close()));
+  const pending = [...connectingClients.values()];
+  connectingClients.clear();
+  await Promise.allSettled(pending);
+  await Promise.allSettled([...activeClients].map((client) => client.close()));
   activeClients.clear();
   sessionClients.clear();
-}
-
-// Improvement 7: stderr capture surfaced on connect failure. StdioClientTransport
-// is spawned with stderr: "pipe" (already the case) but nothing previously
-// read that stream -- a server crashing on startup produced only "connect
-// ECONNRESET"-style transport errors with the server's own diagnostic
-// output (its actual crash reason) silently discarded. This attaches a
-// bounded ring buffer to each stdio transport's stderr and exposes it via
-// getLastStderr, called from index.js/session.js error paths.
-const stderrBuffers = new WeakMap();
-const MAX_STDERR_BYTES = 4096;
-
-export function captureStderr(transport) {
-  if (!transport?.stderr) return;
-  let buf = "";
-  transport.stderr.on("data", (chunk) => {
-    buf += chunk.toString("utf8");
-    if (buf.length > MAX_STDERR_BYTES) buf = buf.slice(buf.length - MAX_STDERR_BYTES);
-  });
-  stderrBuffers.set(transport, () => buf);
-}
-
-export function getLastStderr(transport) {
-  const getter = stderrBuffers.get(transport);
-  return getter ? getter() : "";
 }

@@ -1,156 +1,227 @@
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 import { z } from "zod";
 
-const CONFIG_DIR = path.join(os.homedir(), ".mcp-dev");
-const CONFIG_PATH = path.join(CONFIG_DIR, "servers.json");
-const LOCK_PATH = CONFIG_PATH + ".lock";
+const explicitPath = process.env.MCP_DEV_CONFIG_PATH?.trim();
+const explicitDir = process.env.MCP_DEV_CONFIG_DIR?.trim();
+const defaultDir = path.join(os.homedir(), ".mcp-dev");
 
-// Improvement 1: advisory file lock around read-modify-write config
-// operations. Two concurrent `mcp-dev register` invocations (e.g. two
-// terminal tabs) previously raced: both loadConfig(), both mutate their
-// in-memory copy, both saveConfig() -- second writer wins, first writer's
-// change is silently lost. This uses exclusive-create (`wx`) on a lock file
-// as the mutex; a failed create means someone else holds it, so we spin
-// with backoff until it's free or we time out.
-function acquireLock(timeoutMs = 3000) {
-  const start = Date.now();
+const CONFIG_PATH = explicitPath
+  ? path.resolve(explicitPath)
+  : path.join(path.resolve(explicitDir || defaultDir), "servers.json");
+const CONFIG_DIR = path.dirname(CONFIG_PATH);
+const LOCK_PATH = `${CONFIG_PATH}.lock`;
+const LOCK_TIMEOUT_MS = 3_000;
+const LOCK_STALE_MS = 30_000;
+
+export const SERVER_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
+const ServerNameSchema = z.string().regex(
+  SERVER_NAME_RE,
+  "must be 1–64 characters of letters, digits, dot, underscore, or dash; it must start and end with a letter or digit"
+);
+const EnvRecordSchema = z.record(z.string(), z.string());
+const DescriptionSchema = z.string().trim().min(1).max(240).optional();
+
+const CommonServerFields = {
+  root: z.string().min(1).optional(),
+  description: DescriptionSchema,
+  // Sampling can send server-provided content to a configured model provider.
+  // It is deliberately opt-in per server.
+  allowSampling: z.boolean().optional(),
+};
+
+const StdioServerSchema = z.object({
+  command: z.string().trim().min(1, "command must be a non-empty string"),
+  args: z.array(z.string()).default([]).optional(),
+  cwd: z.string().min(1).optional(),
+  env: EnvRecordSchema.optional(),
+  inheritEnv: z.boolean().optional(),
+  ...CommonServerFields,
+}).strict();
+
+const HttpServerSchema = z.object({
+  url: z.url("url must be a valid absolute URL").refine((value) => {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  }, "url must use http or https"),
+  headers: EnvRecordSchema.optional(),
+  ...CommonServerFields,
+}).strict();
+
+export const ServerEntrySchema = z.union([HttpServerSchema, StdioServerSchema]);
+const ConfigSchema = z.object({
+  servers: z.record(ServerNameSchema, ServerEntrySchema),
+}).strict();
+
+function formatZodError(error, context) {
+  const lines = error.issues.map((issue) => {
+    const issuePath = issue.path.length ? issue.path.join(".") : "(root)";
+    return `  ${issuePath}: ${issue.message}`;
+  });
+  return `${context}:\n${lines.join("\n")}`;
+}
+
+function bestEffortChmod(file, mode) {
+  try { fs.chmodSync(file, mode); } catch { /* Windows and some filesystems do not support POSIX modes. */ }
+}
+
+function ensureConfigDirectory() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  bestEffortChmod(CONFIG_DIR, 0o700);
+}
+
+function ensureConfig() {
+  ensureConfigDirectory();
+  if (!fs.existsSync(CONFIG_PATH)) {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({ servers: {} }, null, 2) + "\n", { mode: 0o600 });
+  }
+  bestEffortChmod(CONFIG_PATH, 0o600);
+}
+
+function sleepSync(ms) {
+  // Atomics.wait sleeps without burning a CPU core while another short-lived
+  // process owns the lock. Node 18+ supports this on the main thread.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function currentLockMetadata() {
+  return JSON.stringify({ pid: process.pid, hostname: os.hostname(), createdAt: Date.now() });
+}
+
+function readLockMetadata() {
+  try { return JSON.parse(fs.readFileSync(LOCK_PATH, "utf8")); } catch { return null; }
+}
+
+function processExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to another user.
+    return error?.code === "EPERM";
+  }
+}
+
+function clearStaleLock() {
+  try {
+    const stat = fs.statSync(LOCK_PATH);
+    if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) return false;
+    const metadata = readLockMetadata();
+    // Do not remove a potentially live lock from another machine on a shared
+    // filesystem. Local orphaned locks can be recovered safely.
+    if (metadata?.hostname && metadata.hostname !== os.hostname()) return false;
+    if (metadata?.pid && processExists(metadata.pid)) return false;
+    fs.unlinkSync(LOCK_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireLock(timeoutMs = LOCK_TIMEOUT_MS) {
+  ensureConfigDirectory();
+  const started = Date.now();
   while (true) {
     try {
-      fs.writeFileSync(LOCK_PATH, String(process.pid), { flag: "wx" });
+      fs.writeFileSync(LOCK_PATH, currentLockMetadata(), { flag: "wx", mode: 0o600 });
       return;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      if (Date.now() - start > timeoutMs) {
-        throw new Error(`Timed out waiting for config lock at ${LOCK_PATH} (held by another mcp-dev process?)`);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      clearStaleLock();
+      if (Date.now() - started >= timeoutMs) {
+        throw new Error(`Timed out waiting for configuration lock at ${LOCK_PATH}. Another mcp-dev command may still be writing.`);
       }
-      const until = Date.now() + 25;
-      while (Date.now() < until) { /* busy-wait: no async available in sync CLI path */ }
+      sleepSync(25);
     }
   }
 }
 
 function releaseLock() {
-  try { fs.unlinkSync(LOCK_PATH); } catch { /* already gone */ }
+  try { fs.unlinkSync(LOCK_PATH); } catch { /* Lock was already removed. */ }
 }
 
-function withLock(fn) {
+function withLock(action) {
   acquireLock();
   try {
-    return fn();
+    return action();
   } finally {
     releaseLock();
   }
 }
 
-const EnvRecordSchema = z.record(z.string(), z.string());
-
-const StdioServerSchema = z
-  .object({
-    command: z.string().min(1, "command must be a non-empty string"),
-    args: z.array(z.string()).optional(),
-    cwd: z.string().optional(),
-    root: z.string().optional(),
-    env: EnvRecordSchema.optional(),
-    inheritEnv: z.boolean().optional(),
-  })
-  .strict();
-
-const HttpServerSchema = z
-  .object({
-    url: z.url("url must be a valid absolute URL"),
-    root: z.string().optional(),
-  })
-  .strict();
-
-const ServerEntrySchema = z.union([HttpServerSchema, StdioServerSchema]);
-
-const ConfigSchema = z.object({
-  servers: z.record(z.string(), ServerEntrySchema),
-});
-
-function formatZodError(err, context) {
-  const lines = err.issues.map((issue) => {
-    const path = issue.path.length ? issue.path.join(".") : "(root)";
-    return `  ${path}: ${issue.message}`;
-  });
-  return `${context}:\n${lines.join("\n")}`;
-}
-
-function ensureConfig() {
-  if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  if (!fs.existsSync(CONFIG_PATH)) fs.writeFileSync(CONFIG_PATH, JSON.stringify({ servers: {} }, null, 2));
-}
-
 export function loadConfig() {
   ensureConfig();
-  const raw = fs.readFileSync(CONFIG_PATH, "utf8");
-
   let parsed;
   try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`${CONFIG_PATH} is not valid JSON: ${err.message}`);
+    parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  } catch (error) {
+    throw new Error(`${CONFIG_PATH} is not valid JSON: ${error.message}`);
   }
 
   const result = ConfigSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new Error(formatZodError(result.error, `${CONFIG_PATH} failed validation`));
-  }
+  if (!result.success) throw new Error(formatZodError(result.error, `${CONFIG_PATH} failed validation`));
   return result.data;
 }
 
-// Improvement 1 (cont.): raw save, no lock -- only called from inside
-// withLock-guarded callers below, so the lock is held for the whole
-// read-modify-write span, not just this final write.
-function saveConfigUnlocked(cfg) {
+function saveConfigUnlocked(config) {
   ensureConfig();
-  const result = ConfigSchema.safeParse(cfg);
-  if (!result.success) {
-    throw new Error(formatZodError(result.error, "Refusing to write invalid config"));
+  const result = ConfigSchema.safeParse(config);
+  if (!result.success) throw new Error(formatZodError(result.error, "Refusing to write invalid configuration"));
+
+  const tempPath = `${CONFIG_PATH}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(result.data, null, 2) + "\n", { mode: 0o600 });
+    bestEffortChmod(tempPath, 0o600);
+    fs.renameSync(tempPath, CONFIG_PATH);
+    bestEffortChmod(CONFIG_PATH, 0o600);
+  } finally {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch { /* cleanup only */ }
   }
-  // Improvement 2: atomic write via temp-file + rename. A crash or
-  // concurrent read mid-write previously risked observing a truncated
-  // servers.json; rename() on POSIX and Windows (same volume) is atomic,
-  // so readers only ever see the old complete file or the new complete
-  // file, never a partial one.
-  const tmpPath = `${CONFIG_PATH}.tmp.${process.pid}.${Date.now()}`;
-  fs.writeFileSync(tmpPath, JSON.stringify(result.data, null, 2));
-  fs.renameSync(tmpPath, CONFIG_PATH);
 }
 
-export function saveConfig(cfg) {
-  withLock(() => saveConfigUnlocked(cfg));
+export function saveConfig(config) {
+  return withLock(() => saveConfigUnlocked(config));
+}
+
+export function assertServerName(name) {
+  const result = ServerNameSchema.safeParse(name);
+  if (!result.success) throw new Error(formatZodError(result.error, `Invalid server name "${name}"`));
+  return result.data;
 }
 
 export function addServer(name, entry) {
-  const entryResult = ServerEntrySchema.safeParse(entry);
-  if (!entryResult.success) {
-    throw new Error(formatZodError(entryResult.error, `Invalid entry for server "${name}"`));
-  }
-  withLock(() => {
-    const cfg = loadConfig();
-    cfg.servers[name] = entryResult.data;
-    saveConfigUnlocked(cfg);
+  const validName = assertServerName(name);
+  const parsedEntry = ServerEntrySchema.safeParse(entry);
+  if (!parsedEntry.success) throw new Error(formatZodError(parsedEntry.error, `Invalid entry for server "${validName}"`));
+
+  return withLock(() => {
+    const config = loadConfig();
+    config.servers[validName] = parsedEntry.data;
+    saveConfigUnlocked(config);
   });
 }
 
 export function removeServer(name) {
-  withLock(() => {
-    const cfg = loadConfig();
-    delete cfg.servers[name];
-    saveConfigUnlocked(cfg);
+  return withLock(() => {
+    const config = loadConfig();
+    if (!(name in config.servers)) return false;
+    delete config.servers[name];
+    saveConfigUnlocked(config);
+    return true;
   });
 }
 
 export function getServer(name) {
-  const cfg = loadConfig();
-  return cfg.servers[name];
+  return loadConfig().servers[name];
 }
 
 export function listServers() {
-  return loadConfig().servers;
+  const servers = loadConfig().servers;
+  return Object.fromEntries(Object.entries(servers).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" })));
 }
 
 export const CONFIG_PATH_EXPORT = CONFIG_PATH;
+export const CONFIG_DIR_EXPORT = CONFIG_DIR;
+export const LOCK_PATH_EXPORT = LOCK_PATH;
