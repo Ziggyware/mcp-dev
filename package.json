@@ -17,7 +17,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --test \"test/*.test.js\"",
     "check": "node ./scripts/check.mjs",
     "smoke": "node ./src/index.js --help && node ./src/index.js completion bash > /dev/null"
   },
