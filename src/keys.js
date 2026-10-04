@@ -125,10 +125,32 @@ function isIncomplete(str) {
 }
 
 /**
+ * SGR mouse report: `CSI < button ; column ; row M|m`. Only decoded when the
+ * terminal was asked for mouse tracking (the session's screen asks for wheel
+ * events); elsewhere the report is swallowed like any other private CSI so it
+ * can never leak into the input line.
+ */
+function decodeMouse(str) {
+  const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(str);
+  if (!match) return null;
+  return {
+    length: match[0].length,
+    event: {
+      type: "mouse",
+      button: Number(match[1]),
+      x: Number(match[2]),
+      y: Number(match[3]),
+      release: match[4] === "m",
+      sequence: match[0],
+    },
+  };
+}
+
+/**
  * Decode one event from the front of `str`.
  * @returns {{length:number, event:object}|{incomplete:true}|{length:number}}
  */
-function decodeOne(str) {
+function decodeOne(str, { mouse = false } = {}) {
   const first = str[0];
 
   if (first !== ESC) {
@@ -169,6 +191,10 @@ function decodeOne(str) {
       return { length: match[0].length, event: applyCsi(match[2], params, match[0]) };
     }
     if (!/[\x40-\x7e]/.test(str.slice(2))) return { incomplete: true };
+    if (mouse) {
+      const report = decodeMouse(str);
+      if (report) return report;
+    }
     // Private CSI (mouse reports, mode replies, terminal queries) carries no
     // input intent — swallow it entirely so it can never leak as text.
     const finalIndex = str.slice(2).search(/[\x40-\x7e]/);
@@ -200,17 +226,26 @@ function decodeOne(str) {
   return { length: 1, event: event("escape", { sequence: ESC }) };
 }
 
-export function createKeyDecoder() {
+export function createKeyDecoder({ mouse = false } = {}) {
   const decoder = new StringDecoder("utf8");
   let buffer = "";
   let pasting = false;
   let pasteText = "";
   let lastChunk = 1;
+  let lastChunkBlock = false;
 
+  /**
+   * `burst` marks keys that arrived inside a *block* of lines rather than from
+   * one keystroke: a multi-line paste (bracketed paste off) or a terminal that
+   * coalesced several keystrokes into one read. It must stay false for ordinary
+   * fast typing — "abc" and Enter arriving in the same read is still an Enter,
+   * and treating it as a newline was what made the prompt look like it needed
+   * two presses. Only a line break with more text behind it means "block".
+   */
   function annotate(ev) {
     if (!ev) return ev;
     if (ev.chunkSize === undefined) ev.chunkSize = lastChunk;
-    ev.burst = lastChunk > 4;
+    ev.burst = lastChunk > 4 && lastChunkBlock;
     return ev;
   }
 
@@ -245,7 +280,7 @@ export function createKeyDecoder() {
         continue;
       }
 
-      const result = decodeOne(buffer);
+      const result = decodeOne(buffer, { mouse });
       if (result.incomplete) break;
       if (!result.event) {
         // Defensive: never loop forever on an undecodable prefix.
@@ -260,9 +295,11 @@ export function createKeyDecoder() {
 
   return {
     push(chunk) {
-      if (typeof chunk === "string") buffer += chunk;
-      else buffer += decoder.write(chunk);
-      lastChunk = typeof chunk === "string" ? chunk.length : chunk.length;
+      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      buffer += text;
+      lastChunk = chunk.length;
+      // A break with more bytes behind it is a block of lines, not one Enter.
+      lastChunkBlock = /[\r\n][\s\S]/.test(text);
       return consume();
     },
     /** True when the buffer holds a possibly-incomplete sequence. */
@@ -297,6 +334,10 @@ export function createKeyDecoder() {
 export function describeEvent(ev) {
   if (!ev) return "none";
   if (ev.type === "paste") return `paste(${ev.text.length})`;
+  if (ev.type === "mouse") {
+    const wheel = (ev.button & 64) === 64 ? (ev.button & 1 ? "down" : "up") : null;
+    return `mouse:${wheel ? `wheel-${wheel}` : `button-${ev.button}`}`;
+  }
   const mods = [ev.ctrl && "ctrl", ev.meta && "alt", ev.shift && "shift"].filter(Boolean).join("+");
   const label = ev.name === "char" && ev.text ? `char:${JSON.stringify(ev.text)}` : ev.name;
   return mods ? `${mods}+${label}` : label;

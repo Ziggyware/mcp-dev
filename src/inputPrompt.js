@@ -2,14 +2,22 @@
 //
 // The interactive input runtime behind every session prompt: the main palette,
 // argument forms, path navigation, the JSON editor, and approvals. It owns
-// raw-mode stdin, the key decoder, the inline renderer, and the editing model.
+// raw-mode stdin, the key decoder, the renderer, and the editing model.
 //
 // Responsibilities are deliberately narrow: this module never knows what a
 // command or a tool is — callers supply completions, previews, and key
 // overrides, and receive the submitted text.
+//
+// Two rendering modes share one editing model:
+//   * inside the session, the prompt is a block pinned to the bottom of
+//     ./screen.js, which owns the alternate buffer and the transcript;
+//   * everywhere else (one-shot `mcp-dev call`, registration wizards) it draws
+//     through ./frame.js in the normal buffer, keeping the scrollback intact.
 
 import { createKeyDecoder, TERMINAL_MODES } from "./keys.js";
 import { InlineFrame } from "./frame.js";
+import { Screen } from "./screen.js";
+import { drainBytes, drainEvents, hasPending, pushBytes, pushEvents } from "./typeahead.js";
 import { visibleWidth, clipText } from "./terminal.js";
 import { colors, marks, style } from "./colors.js";
 import * as L from "./lineEditor.js";
@@ -119,13 +127,14 @@ export class InputHistory {
  * @param {string|Function} [options.message] prompt prefix (default "❯")
  * @param {string} [options.initialText]
  * @param {"enter"|"ctrl+enter"} [options.submitKey]
- * @param {Function} [options.completions] async (text, state) => { items, note }
- * @param {Function} [options.preview] async (state) => string[]
+ * @param {Function} [options.completions] (text, state) => {items, note} — may be sync
+ * @param {Function} [options.preview] (state) => string[]
  * @param {Function} [options.hints] (state) => string[]
  * @param {Function} [options.footer] (state) => string[]
  * @param {Function} [options.onKey] (event, api) => boolean (true = handled)
  * @param {Function} [options.validate] (text) => true | string
  * @param {InputHistory} [options.history]
+ * @param {Screen} [options.screen] full-screen surface (defaults to the active one)
  * @param {number} [options.menuSize]
  * @param {boolean} [options.tabInserts] fall back to a literal tab
  * @param {boolean} [options.allowNewline]
@@ -137,8 +146,10 @@ export function runPrompt(options = {}) {
     return Promise.resolve({ ok: false, reason: "not-a-tty" });
   }
 
-  const frame = new InlineFrame(output);
-  const decoder = createKeyDecoder();
+  const screen = options.screen === null ? null : options.screen ?? Screen.current;
+  const frame = screen ? null : new InlineFrame(output);
+  const width = () => (screen ? screen.width : frame.width);
+  const decoder = createKeyDecoder({ mouse: Boolean(screen) });
   const history = options.history ?? null;
   const killRing = options.killRing ?? new KillRing();
   const menuSize = options.menuSize ?? 6;
@@ -162,6 +173,7 @@ export function runPrompt(options = {}) {
     busy: false,
     ghost: "",
     requestId: 0,
+    completedFor: null, // the text `entries` were computed for
     closed: false,
   };
 
@@ -171,6 +183,7 @@ export function runPrompt(options = {}) {
   let flushTimer = null;
   let completionTimer = null;
   let transientTimer = null;
+  let completionPromise = null;
 
   const promptPrefix = () => {
     const value = typeof options.message === "function" ? options.message(state) : options.message;
@@ -183,7 +196,7 @@ export function runPrompt(options = {}) {
   };
 
   // ---------------------------------------------------------------- rendering
-  function buildInputLines(width, prompt) {
+  function buildInputLines(columnWidth, prompt) {
     const lines = [];
     let caret = null;
     const textLines = state.line.text.split("\n");
@@ -192,7 +205,7 @@ export function runPrompt(options = {}) {
     for (let index = 0; index < textLines.length; index++) {
       const isCaretLine = index === caretPos.row;
       const prefix = index === 0 ? `${prompt} ` : indent;
-      const available = Math.max(8, width - visibleWidth(prefix));
+      const available = Math.max(8, columnWidth - visibleWidth(prefix));
       if (isCaretLine) {
         const window = L.horizontalWindow(textLines[index], caretPos.col, available);
         if (typeof options.decorateInput === "function") {
@@ -225,13 +238,13 @@ export function runPrompt(options = {}) {
         lines.push(`${leftMark}${prefix}${before}${after}${suffix}${rightMark}`);
         caret = { row: lines.length - 1, col: visibleWidth(leftMark) + visibleWidth(prefix) + window.caret };
       } else {
-        lines.push(clipText(`${prefix}${textLines[index]}`, width));
+        lines.push(clipText(`${prefix}${textLines[index]}`, columnWidth));
       }
     }
     return { lines, caret };
   }
 
-  function buildMenuLines(width) {
+  function buildMenuLines(columnWidth) {
     if (!state.entries.length) return { lines: [], height: 0 };
     const lines = [];
     const start = Math.max(0, Math.min(state.selected - 1, state.entries.length - menuSize));
@@ -247,7 +260,7 @@ export function runPrompt(options = {}) {
       const rendered = active ? style.selected(color(label)) : color(label);
       const badge = item.badge ? ` ${item.badge}` : "";
       const description = item.description ? `  ${colors.faint(item.description)}` : "";
-      lines.push(clipText(`  ${pointer} ${rendered}${badge}${description}`, width));
+      lines.push(clipText(`  ${pointer} ${rendered}${badge}${description}`, columnWidth));
     }
     if (state.entries.length > menuSize) {
       const hidden = state.entries.length - visible.length;
@@ -256,71 +269,140 @@ export function runPrompt(options = {}) {
     return { lines, height: lines.length };
   }
 
+  function transientLine(columnWidth) {
+    if (!state.transient) return [];
+    const tone = state.transient.tone === "error" ? colors.error
+      : state.transient.tone === "warn" ? colors.warning
+        : state.transient.tone === "success" ? colors.success
+          : colors.muted;
+    return [clipText(`  ${tone(state.transient.text)}`, columnWidth)];
+  }
+
+  /**
+   * Keep the sections that fit. The input line is never dropped, the selection
+   * menu outranks everything else, and the title keeps its *last* lines (the
+   * field label on an argument form sits directly above the input).
+   */
+  function selectTail(items, space) {
+    if (space <= 0) return [];
+    const chosen = new Set();
+    let used = 0;
+    for (const item of [...items].sort((a, b) => b.priority - a.priority)) {
+      if (used + item.lines.length <= space) {
+        chosen.add(item);
+        used += item.lines.length;
+      }
+    }
+    return items.filter((item) => chosen.has(item));
+  }
+
+  function assemble(head, body, bodyCaret, tailItems, budget) {
+    const tail = selectTail(tailItems, budget - head.length - body.length).flatMap((item) => item.lines);
+    let headLines = [...head];
+    let bodyLines = [...body];
+    let caretRow = bodyCaret?.row ?? 0;
+    const total = () => headLines.length + bodyLines.length + tail.length;
+    if (total() > budget && headLines.length) {
+      const available = Math.max(0, budget - bodyLines.length - tail.length);
+      if (available <= 0) headLines = [];
+      else if (headLines.length > available) {
+        const keep = Math.max(0, available - 1);
+        const marker = colors.faint(`  … ${headLines.length - keep} more line${headLines.length - keep === 1 ? "" : "s"}`);
+        headLines = keep > 0 ? [marker, ...headLines.slice(headLines.length - keep)] : [marker];
+      }
+    }
+    if (total() > budget && bodyLines.length > 1) {
+      const room = Math.max(1, budget - tail.length - headLines.length);
+      const dropped = Math.max(0, bodyLines.length - room);
+      bodyLines = bodyLines.slice(dropped);
+      caretRow = Math.max(0, caretRow - dropped);
+    }
+    return {
+      lines: [...headLines, ...bodyLines, ...tail],
+      caret: bodyCaret ? { row: headLines.length + caretRow, col: bodyCaret.col } : null,
+    };
+  }
+
   function build() {
-    const width = frame.width;
-    const lines = [];
-    let caret = null;
-    for (const line of titleLines()) lines.push(line);
-
+    const columnWidth = width();
     const prompt = promptPrefix();
-    const input = buildInputLines(width, prompt);
-    lines.push(...input.lines);
-    caret = input.caret;
+    const input = buildInputLines(columnWidth, prompt);
+    const overlayOpen = Boolean(state.overlay);
+    const searching = Boolean(state.search);
+    const budget = screen
+      ? (overlayOpen ? Math.max(4, screen.height - 2) : screen.promptBudget())
+      : frame.maxHeight;
 
-    for (const line of (typeof options.footer === "function" ? options.footer(state) ?? [] : options.footer ?? [])) {
-      lines.push(line);
+    const tailItems = [];
+    if (!overlayOpen && !searching) {
+      const footerLines = typeof options.footer === "function" ? options.footer(state) ?? [] : options.footer ?? [];
+      if (footerLines.length) tailItems.push({ lines: footerLines, priority: 4 });
+      const transient = transientLine(columnWidth);
+      if (transient.length) tailItems.push({ lines: transient, priority: 3 });
+      const menu = buildMenuLines(columnWidth);
+      if (menu.lines.length) tailItems.push({ lines: menu.lines, priority: 9 });
+      if (state.note) tailItems.push({ lines: [clipText(`  ${colors.warning(state.note)}`, columnWidth)], priority: 5 });
+      const previewLines = typeof options.preview === "function" ? options.preview(state) ?? [] : [];
+      if (previewLines.length) {
+        tailItems.push({ lines: previewLines.map((line) => clipText(`  ${line}`, columnWidth)), priority: 6 });
+      }
     }
 
-    if (state.transient) {
-      const tone = state.transient.tone === "error" ? colors.error
-        : state.transient.tone === "warn" ? colors.warning
-          : state.transient.tone === "success" ? colors.success
-            : colors.muted;
-      lines.push(clipText(`  ${tone(state.transient.text)}`, width));
-    }
-
-    if (state.overlay) {
-      const window = state.overlay.slice(state.overlayOffset, state.overlayOffset + Math.max(4, (output.rows ?? 24) - lines.length - 3));
-      for (const line of window) lines.push(line);
-      lines.push(colors.faint("  ↑/↓ scroll · Esc close"));
-      return { lines, caret };
-    }
-
-    if (state.search) {
-      const matches = state.search.matches;
-      lines.push(clipText(`  ${colors.yellow("reverse-i-search:")} ${state.search.query}`, width));
-      const windowed = matches.slice(0, 5);
+    if (overlayOpen) {
+      const rows = state.overlay.slice(state.overlayOffset, state.overlayOffset + Math.max(4, budget - input.lines.length - 3));
+      tailItems.push({ lines: [colors.faint("  ↑/↓ scroll · PgUp/PgDn page · Esc close"), ...rows], priority: 10 });
+    } else if (searching) {
+      const searchLines = [clipText(`  ${colors.yellow("reverse-i-search:")} ${state.search.query}`, columnWidth)];
+      const windowed = state.search.matches.slice(0, 5);
       for (let index = 0; index < windowed.length; index++) {
         const active = index === state.search.index;
-        lines.push(clipText(`  ${active ? marks.pointer() : " "} ${active ? colors.bold(windowed[index]) : colors.muted(windowed[index])}`, width));
+        searchLines.push(clipText(`  ${active ? marks.pointer() : " "} ${active ? colors.bold(windowed[index]) : colors.muted(windowed[index])}`, columnWidth));
       }
-      return { lines, caret };
-    }
-
-    const menu = buildMenuLines(width);
-    if (menu.lines.length) lines.push(...menu.lines);
-    if (state.note) lines.push(clipText(`  ${colors.warning(state.note)}`, width));
-
-    const previewLines = typeof options.preview === "function" ? options.preview(state) ?? [] : [];
-    if (previewLines.length) {
-      for (const line of previewLines) lines.push(clipText(`  ${line}`, width));
+      tailItems.push({ lines: searchLines, priority: 10 });
     }
 
     const hintLines = typeof options.hints === "function" ? options.hints(state) ?? [] : options.hints ?? [];
     if (hintLines.length) {
-      lines.push(colors.faint(clipText(hintLines.map((line) => line).join("  ·  "), width)));
+      tailItems.push({ lines: [colors.faint(clipText(hintLines.join("  ·  "), columnWidth))], priority: 2 });
     }
 
-    return { lines, caret };
+    return assemble(titleLines(), input.lines, input.caret, tailItems, budget);
   }
 
   function render() {
     if (finished) return;
     const { lines, caret } = build();
-    frame.render(lines, caret);
+    if (screen) {
+      screen.setPrompt(lines.length ? { lines, caret } : null);
+      screen.render();
+    } else {
+      frame.render(lines, caret);
+    }
   }
 
   // ------------------------------------------------------------- completions
+  /** Returns a plain result when the caller is synchronous (the common case). */
+  function invokeCompletions(text) {
+    let result;
+    try {
+      result = options.completions(text, { cursor: state.line.cursor, state });
+    } catch {
+      return { items: [] };
+    }
+    return result;
+  }
+
+  function applyCompletions(text, result) {
+    const items = Array.isArray(result) ? result : result?.items ?? [];
+    state.note = result?.note ?? null;
+    // Callers rank and limit their own completions (fuzzy ranking happens in
+    // the caller so it can mix sources); the runtime only displays them.
+    state.entries = items.slice(0, 200).map((item) => ({ item, indices: item.indices ?? [] }));
+    if (state.selected >= state.entries.length) state.selected = Math.max(0, state.entries.length - 1);
+    state.ghost = computeGhost(text);
+    state.completedFor = text;
+  }
+
   function scheduleCompletions(delay = COMPLETION_DEBOUNCE_MS) {
     if (!options.completions) return;
     if (completionTimer) clearTimeout(completionTimer);
@@ -329,24 +411,40 @@ export function runPrompt(options = {}) {
 
   async function refreshCompletions() {
     if (!options.completions || finished) return;
+    if (completionTimer) {
+      clearTimeout(completionTimer);
+      completionTimer = null;
+    }
     const requestId = ++state.requestId;
     const text = state.line.text;
-    let result;
-    try {
-      result = await options.completions(text, { cursor: state.line.cursor, state });
-    } catch {
-      result = { items: [] };
+    const result = invokeCompletions(text);
+    if (result && typeof result.then !== "function") {
+      // Synchronous source: no race, the menu is correct on the first keypress.
+      if (requestId === state.requestId && !finished && state.line.text === text) {
+        applyCompletions(text, result);
+        render();
+      }
+      return;
     }
+    completionPromise = Promise.resolve(result).catch(() => ({ items: [] }));
+    const resolved = await completionPromise;
     if (requestId !== state.requestId || finished) return;
     if (state.line.text !== text) return;
-    const items = Array.isArray(result) ? result : result?.items ?? [];
-    state.note = result?.note ?? null;
-    // Callers rank and limit their own completions (fuzzy ranking happens in
-    // the caller so it can mix sources); the runtime only displays them.
-    state.entries = items.slice(0, 200).map((item) => ({ item, indices: item.indices ?? [] }));
-    if (state.selected >= state.entries.length) state.selected = Math.max(0, state.entries.length - 1);
+    applyCompletions(text, resolved);
     state.ghost = computeGhost(text);
     render();
+  }
+
+  /**
+   * Make sure `entries` describe the line as it is right now. Tab/Enter/↑/↓
+   * used to act on the *previous* keystroke's menu when the user typed fast
+   * (or before an async completion resolved), which is why a completion needed
+   * two presses. This flushes the pending request first.
+   */
+  async function syncCompletions() {
+    if (!options.completions) return;
+    if (state.completedFor === state.line.text && !completionTimer) return;
+    await refreshCompletions();
   }
 
   function computeGhost(text) {
@@ -382,21 +480,17 @@ export function runPrompt(options = {}) {
     }
   }
 
-  function replaceSelection(text) {
-    setLine(L.replaceRange(state.line, state.lastAccepted?.regionStart ?? 0, state.line.cursor, text));
-  }
-
   function acceptCompletion({ reverse = false, viaTab = true } = {}) {
     const entry = state.entries[state.selected];
     if (!entry) {
       if (viaTab && tabInserts) setLine(L.insertText(state.line, "\t"));
       else setTransient("No completion available.", "warn", { ttl: 1600 });
-      return;
+      return false;
     }
     const item = entry.item;
     if (item.complete === false) {
       if (viaTab && tabInserts) setLine(L.insertText(state.line, "\t"));
-      return;
+      return false;
     }
     const regionStart = item.regionStart ?? state.lastAccepted?.regionStart ?? 0;
     const current = state.line.text.slice(regionStart, state.line.cursor);
@@ -410,11 +504,12 @@ export function runPrompt(options = {}) {
         state.selected = wrapped;
         state.lastAccepted = { regionStart, text: candidate.insertText };
         setLine(L.replaceRange(state.line, regionStart, state.line.cursor, candidate.insertText), { resetCompletion: false });
+        state.userMoved = true;
         scheduleCompletions();
-        return;
+        return true;
       }
       if (viaTab && tabInserts) setLine(L.insertText(state.line, "\t"));
-      return;
+      return false;
     }
     state.lastAccepted = { regionStart, text: item.insertText };
     state.selected = Math.max(0, state.entries.findIndex((candidate) => candidate.item === item));
@@ -425,7 +520,54 @@ export function runPrompt(options = {}) {
       ? L.insertText(next, " ")
       : next;
     setLine(withSpace, { resetCompletion: false });
+    state.userMoved = true;
     scheduleCompletions();
+    return true;
+  }
+
+  /** The text the highlighted completion would produce for the current line. */
+  function completionTarget(item) {
+    const regionStart = item.regionStart ?? state.lastAccepted?.regionStart ?? 0;
+    const current = state.line.text.slice(regionStart, state.line.cursor);
+    if (current === item.insertText) return { text: state.line.text, item };
+    const next = L.replaceRange(state.line, regionStart, state.line.cursor, item.insertText);
+    const withSpace = item.trailingSpace && !next.text.slice(next.cursor).startsWith(" ")
+      ? L.insertText(next, " ")
+      : next;
+    return { text: withSpace.text, item };
+  }
+
+  /**
+   * Enter inside an open menu should never need a second press. It uses the
+   * highlighted suggestion when the user clearly aimed at it — they moved the
+   * selection with ↑/↓, or they typed a prefix of that suggestion (`/serv` →
+   * `/servers`, `ech` → `echo`). An unrelated highlight (a full line submitted
+   * as typed, or a picker browsing on an empty line) still runs exactly what is
+   * on the line, so `/demo/` keeps opening the tool list instead of jumping
+   * into whichever tool happens to be first.
+   */
+  function submitWithHighlight() {
+    const item = state.entries[state.selected]?.item;
+    if (!item) {
+      void submit();
+      return;
+    }
+    if (item.complete === false) {
+      void submit(item.submitText ?? state.line.text, item);
+      return;
+    }
+    const regionStart = item.regionStart ?? state.lastAccepted?.regionStart ?? 0;
+    const current = state.line.text.slice(regionStart, state.line.cursor);
+    const target = String(item.insertText ?? "");
+    const aimed = state.userMoved
+      || (current.trim() !== "" && (target.startsWith(current) || target.replace(/^\//, "").startsWith(current)));
+    if (!aimed) {
+      void submit();
+      return;
+    }
+    const resolved = completionTarget(item);
+    setLine(L.createLine(resolved.text, resolved.text.length), { resetCompletion: false });
+    void submit(resolved.text, item);
   }
 
   function navigateMenu(delta) {
@@ -482,16 +624,35 @@ export function runPrompt(options = {}) {
     render();
   }
 
+  /** In screen mode the echoed line joins the transcript instead of stdout. */
+  function echoLine(value) {
+    const prompt = promptPrefix();
+    const textLines = String(value ?? "").split("\n");
+    const indent = " ".repeat(visibleWidth(prompt) + 1);
+    return textLines
+      .map((line, index) => `${index === 0 ? `${prompt} ` : indent}${style.body(line)}`)
+      .join("\n");
+  }
+
   function finish(result) {
     if (finished) return;
     finished = true;
     detach();
-    frame.erase();
-    if (result.ok && options.echo !== false && result.text) {
-      const prompt = promptPrefix();
-      const textLines = String(result.text).split("\n");
-      const indent = " ".repeat(visibleWidth(prompt) + 1);
-      output.write(textLines.map((line, index) => `${index === 0 ? `${prompt} ` : indent}${style.body(line)}`).join("\n") + "\n");
+    if (screen) {
+      screen.setPrompt(null);
+      // Submitting a line means "run it and show me": follow the newest output
+      // from here on, even if the reader had scrolled back to an older result.
+      if (result.ok) screen.scrollToBottom();
+      if (result.ok && options.echo !== false && result.text) screen.write(`${echoLine(result.text)}\n`);
+      screen.render();
+    } else {
+      frame.erase();
+      if (result.ok && options.echo !== false && result.text) {
+        const prompt = promptPrefix();
+        const textLines = String(result.text).split("\n");
+        const indent = " ".repeat(visibleWidth(prompt) + 1);
+        output.write(textLines.map((line, index) => `${index === 0 ? `${prompt} ` : indent}${style.body(line)}`).join("\n") + "\n");
+      }
     }
     resolveResult(result);
   }
@@ -531,7 +692,7 @@ export function runPrompt(options = {}) {
     closeOverlay,
     close: (reason = "cancel") => finish({ ok: false, reason }),
     render,
-    clearMenu: () => { state.entries = []; state.selected = 0; render(); },
+    clearMenu: () => { state.entries = []; state.completedFor = null; state.selected = 0; render(); },
     acceptCompletion: (opts) => acceptCompletion(opts),
     killRing,
   };
@@ -582,15 +743,27 @@ export function runPrompt(options = {}) {
       closeOverlay();
       return;
     }
+    const page = Math.max(4, (screen ? screen.height : output.rows ?? 24) - 6);
     if (event.name === "down") { state.overlayOffset += 1; render(); return; }
     if (event.name === "up") { state.overlayOffset = Math.max(0, state.overlayOffset - 1); render(); return; }
-    if (event.name === "pageup") { state.overlayOffset = Math.max(0, state.overlayOffset - 10); render(); return; }
-    if (event.name === "pagedown") { state.overlayOffset += 10; render(); }
+    if (event.name === "pageup") { state.overlayOffset = Math.max(0, state.overlayOffset - page); render(); return; }
+    if (event.name === "pagedown") { state.overlayOffset += page; render(); }
   }
 
   function handleKey(event) {
+    if (event.type === "mouse") {
+      if (screen && screen.handleKey(event)) render();
+      return;
+    }
     if (state.overlay) return handleOverlayKey(event);
     if (state.search) return handleSearchKey(event);
+
+    // Transcript scrolling owns a few keys of its own (PgUp/PgDn, Shift+↑/↓,
+    // Ctrl+Home/End); everything else belongs to the editor.
+    if (screen && screen.handleKey(event)) {
+      render();
+      return;
+    }
 
     if (options.onKey && options.onKey(event, api) === true) {
       render();
@@ -599,9 +772,46 @@ export function runPrompt(options = {}) {
 
     const { line } = state;
 
+    /** Enter (or Ctrl+Enter when Enter is the newline key). */
+    const handleEnter = (event) => {
+      const wantsNewline = !submitOnCtrlEnter
+        ? (event.ctrl || event.meta || event.shift || event.burst) && allowNewline
+        : !(event.ctrl || event.meta) && !event.shift;
+      if (wantsNewline) {
+        setLine(L.insertText(state.line, "\n"), { resetCompletion: false });
+        scheduleCompletions(0);
+        return;
+      }
+      if (state.entries.length && state.completedFor === state.line.text) {
+        submitWithHighlight();
+        return;
+      }
+      if (state.entries.length && state.completedFor !== state.line.text) {
+        // The menu on screen may not describe this line yet (typing outran the
+        // completion request): flush it, then act with the fresh list.
+        void syncCompletions().then(() => {
+          if (finished) return;
+          if (state.entries.length) submitWithHighlight();
+          else void submit();
+        });
+        return;
+      }
+      void submit();
+    };
+
     if (event.name === "newline") {
-      setLine(L.insertText(line, "\n"), { resetCompletion: false });
-      scheduleCompletions(0);
+      // A bare line feed is how some terminals encode the Return key, and how
+      // the tty delivers it in the short cooked-mode gap between two prompts.
+      // Treating it as "insert a newline" made Enter look like it needed two
+      // presses; only an explicit newline (Ctrl/Shift+Enter) or a pasted block
+      // still inserts one.
+      const explicit = event.ctrl || event.meta || event.shift;
+      if (allowNewline && (explicit || event.burst)) {
+        setLine(L.insertText(line, "\n"), { resetCompletion: false });
+        scheduleCompletions(0);
+        return;
+      }
+      handleEnter(event);
       return;
     }
 
@@ -621,37 +831,35 @@ export function runPrompt(options = {}) {
     }
 
     if (event.name === "enter") {
-      const wantsNewline = !submitOnCtrlEnter
-        ? (event.ctrl || event.meta || event.shift || event.burst) && allowNewline
-        : !(event.ctrl || event.meta) && !event.shift;
-      if (wantsNewline) {
-        setLine(L.insertText(line, "\n"), { resetCompletion: false });
-        scheduleCompletions(0);
-        return;
-      }
-      if (state.entries.length && state.userMoved) {
-        const item = state.entries[state.selected]?.item;
-        if (item?.complete === false) {
-          void submit(item.submitText ?? line.text, item);
-          return;
-        }
-        acceptCompletion({ viaTab: false });
-        return;
-      }
-      void submit();
+      handleEnter(event);
       return;
     }
 
     if (event.name === "tab" || event.name === "backtab") {
-      if (state.entries.length && state.entries[state.selected]?.item.complete !== false) {
-        acceptCompletion({ reverse: event.name === "backtab" });
-      } else if (event.name === "tab" && event.shift && options.onShiftTab) {
-        options.onShiftTab(api);
-      } else if (event.name === "backtab" && options.onShiftTab) {
-        options.onShiftTab(api);
-      } else if (event.name === "tab" && tabInserts) {
-        setLine(L.insertText(line, "\t"), { resetCompletion: false });
+      const reverse = event.name === "backtab";
+      const shifted = event.name === "tab" && Boolean(event.shift);
+      const applyTab = () => {
+        if (state.entries.length && state.entries[state.selected]?.item.complete !== false) {
+          acceptCompletion({ reverse });
+          return;
+        }
+        if (options.onShiftTab && (reverse || shifted)) {
+          options.onShiftTab(api);
+          return;
+        }
+        if (!reverse && tabInserts) setLine(L.insertText(state.line, "\t"), { resetCompletion: false });
+      };
+      if (state.completedFor !== state.line.text) {
+        // Never let a stale menu decide: completing "ec" to "echo" must not be
+        // blocked because the request for the current text is still in flight.
+        void syncCompletions().then(() => {
+          if (finished) return;
+          applyTab();
+          render();
+        });
+        return;
       }
+      applyTab();
       return;
     }
 
@@ -670,9 +878,15 @@ export function runPrompt(options = {}) {
       return;
     }
     if (event.ctrl && event.name === "char" && event.text === "l") {
-      output.write("\x1b[2J\x1b[H");
-      frame.height = 0;
-      render();
+      if (screen) {
+        screen.clearTranscript();
+        screen.render();
+      } else {
+        output.write("\x1b[2J\x1b[H");
+        frame.height = 0;
+        frame.cursorRow = 0;
+        render();
+      }
       return;
     }
     if (event.ctrl && event.name === "char" && event.text === "c") { cancel(); return; }
@@ -730,22 +944,64 @@ export function runPrompt(options = {}) {
   }
 
   // --------------------------------------------------------------- lifecycle
-  function onData(chunk) {
-    if (finished) return;
-    let events = decoder.push(chunk);
-    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-    if (decoder.pending()) {
-      flushTimer = setTimeout(() => {
-        const flushed = decoder.forceFlush();
-        for (const event of flushed) handleKey(event);
-        render();
-      }, ESCAPE_FLUSH_MS);
-    }
-    for (const event of events) {
+  /**
+   * Feed decoded keys to the editor. When one of them finishes the prompt, the
+   * rest of the batch still belongs to the user: it is queued as type-ahead for
+   * the next prompt instead of being dropped (a fast typist would otherwise lose
+   * everything typed in the same read as Enter, and a quick double Ctrl+C would
+   * only ever register once).
+   */
+  function dispatch(events) {
+    for (let index = 0; index < events.length; index += 1) {
+      if (finished) {
+        pushEvents(events.slice(index));
+        return;
+      }
+      const event = events[index];
       if (event.type === "paste") insertPasted(event.text);
       else handleKey(event);
     }
+  }
+
+  function flushDecoder() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (!decoder.pending()) return;
+    dispatch(decoder.forceFlush());
+  }
+
+  function onData(chunk) {
+    if (finished) {
+      // The prompt is already done but its `data` listener has not been
+      // detached yet (the result callback runs first): keep the keys.
+      pushBytes(chunk);
+      return;
+    }
+    const events = decoder.push(chunk);
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (decoder.pending()) {
+      flushTimer = setTimeout(() => {
+        flushDecoder();
+        render();
+      }, ESCAPE_FLUSH_MS);
+    }
+    dispatch(events);
     if (events.length) render();
+  }
+
+  /** Replay anything typed while a spinner owned stdin (type-ahead). */
+  function replayTypeahead() {
+    if (!hasPending()) return;
+    const pendingEvents = drainEvents();
+    const pendingBytes = drainBytes();
+    if (pendingEvents.length) dispatch(pendingEvents);
+    for (let index = 0; index < pendingBytes.length; index += 1) {
+      if (finished) {
+        // Hand the untouched chunks back so the prompt after this one sees them.
+        for (let rest = index; rest < pendingBytes.length; rest += 1) pushBytes(pendingBytes[rest]);
+        return;
+      }
+      dispatch(decoder.push(pendingBytes[index]));
+    }
   }
 
   function onSigint() { cancel(); }
@@ -762,7 +1018,9 @@ export function runPrompt(options = {}) {
     input.on("end", onEnd);
     output.on?.("resize", onResize);
     process.on("SIGINT", onSigint);
-    output.write(TERMINAL_MODES.enter);
+    // The screen already holds bracket paste / keyboard protocols for the whole
+    // session; a one-shot prompt turns them on for its own lifetime.
+    if (!screen) output.write(TERMINAL_MODES.enter);
     // Ctrl+D pressed between commands can end the stream before this prompt
     // attaches; without this check the prompt would wait forever on a stdin
     // that can never produce another byte.
@@ -770,6 +1028,7 @@ export function runPrompt(options = {}) {
       finish({ ok: false, reason: "eof" });
       return;
     }
+    replayTypeahead();
   }
 
   function detach() {
@@ -780,9 +1039,11 @@ export function runPrompt(options = {}) {
     input.off?.("end", onEnd);
     output.off?.("resize", onResize);
     process.off("SIGINT", onSigint);
-    input.setRawMode?.(false);
+    // The screen keeps raw mode for the whole session; a one-shot prompt gives
+    // the tty back to the shell when it finishes.
+    if (!screen) input.setRawMode?.(false);
     input.pause?.();
-    output.write(TERMINAL_MODES.leave);
+    if (!screen) output.write(TERMINAL_MODES.leave);
   }
 
   attach();

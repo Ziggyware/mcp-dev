@@ -143,7 +143,7 @@ export async function promptJsonValue({
     menuSize: 6,
     history: null,
     status: { text: "Enter newline · Ctrl+Enter save · Tab indent/template · Esc cancel", tone: "info" },
-    completions: async (text) => {
+    completions: (text) => {
       if (!resultBuffer || !text.trim().startsWith("!")) return { items: [] };
       return { items: cachedRefItems(resultBuffer, text.trim().split(/\s/)[0]) };
     },

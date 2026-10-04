@@ -3,11 +3,17 @@
 // Progress indicator for tool calls and server connections. Long calls used to
 // block with no feedback and no way to stop them; the spinner shows elapsed
 // time and stays cancellable (Ctrl+C or Esc) while a call is in flight.
+//
+// Inside a session the spinner is a single activity cell on the screen's status
+// bar, so it can never scroll the transcript or tear the input block. Outside a
+// session (one-shot `mcp-dev call`) it keeps painting an inline frame.
 
 import { InlineFrame } from "./frame.js";
+import { Screen } from "./screen.js";
+import { pushBytes, splitCancelChunk } from "./typeahead.js";
+import { createKeyDecoder, TERMINAL_MODES } from "./keys.js";
 import { colors, marks } from "./colors.js";
 import { stripAnsi, visibleWidth } from "./terminal.js";
-import { TERMINAL_MODES } from "./keys.js";
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_MS = 90;
@@ -18,52 +24,72 @@ function formatElapsed(ms) {
   return `${Math.floor(ms / 60_000)}m ${String(Math.round((ms % 60_000) / 1000)).padStart(2, "0")}s`;
 }
 
-export function createSpinner({ output = process.stdout } = {}) {
-  const frame = new InlineFrame(output);
+function toneColor(tone) {
+  return tone === "error" ? colors.error : tone === "warn" ? colors.warning : tone === "muted" ? colors.muted : colors.success;
+}
+
+export function createSpinner({ output = process.stdout, screen = null, label = "" } = {}) {
+  const target = screen ?? Screen.current;
+  const frame = target ? null : new InlineFrame(output);
+  const startedAtRef = { value: 0 };
   let timer = null;
-  let startedAt = 0;
-  let label = "";
+  let currentLabel = label;
   let detail = "";
   let active = false;
+  const startedAt = () => startedAtRef.value;
 
   const render = () => {
     if (!active) return;
-    const glyph = colors.accent(FRAMES[Math.floor((Date.now() - startedAt) / TICK_MS) % FRAMES.length]);
-    const elapsed = colors.faint(formatElapsed(Date.now() - startedAt));
-    const suffix = detail ? ` ${colors.warning(detail)}` : "";
-    frame.render([`${glyph} ${label} ${elapsed}${suffix}`], null);
+    const glyph = FRAMES[Math.floor((Date.now() - startedAt()) / TICK_MS) % FRAMES.length];
+    const suffix = detail ? ` ${detail}` : "";
+    if (target) {
+      target.setActivity(`${colors.accent(glyph)} ${currentLabel}${suffix ? ` ${colors.warning(suffix.trim())}` : ""}`, { startedAt: startedAt() });
+      target.render();
+      return;
+    }
+    frame.render([`${colors.accent(glyph)} ${currentLabel} ${colors.faint(formatElapsed(Date.now() - startedAt()))}${suffix}`], null);
   };
 
   return {
     start(nextLabel) {
-      label = nextLabel;
+      currentLabel = nextLabel;
       detail = "";
-      startedAt = Date.now();
+      startedAtRef.value = Date.now();
       active = true;
       render();
       timer = setInterval(render, TICK_MS);
       timer.unref?.();
     },
     update(nextLabel, nextDetail = "") {
-      label = nextLabel;
+      currentLabel = nextLabel;
       detail = nextDetail;
       render();
     },
     /** Stop and print a permanent status line. */
     stop(text = "", { tone = "success" } = {}) {
       if (!active) {
-        if (text) output.write(`${text}\n`);
+        if (text) {
+          if (target) {
+            target.write(`${toneColor(tone)(text)}\n`);
+            target.render();
+          } else {
+            output.write(`${text}\n`);
+          }
+        }
         return;
       }
       active = false;
       if (timer) clearInterval(timer);
       timer = null;
-      const elapsed = formatElapsed(Date.now() - startedAt);
-      frame.erase();
-      if (text) {
-        const color = tone === "error" ? colors.error : tone === "warn" ? colors.warning : tone === "muted" ? colors.muted : colors.success;
-        output.write(`${color(text)} ${colors.faint(elapsed)}\n`);
+      const elapsed = formatElapsed(Date.now() - startedAt());
+      if (target) {
+        target.setActivity(null);
+        target.write(text ? `${toneColor(tone)(text)} ${colors.faint(elapsed)}\n` : "");
+        target.render();
+        return;
       }
+      frame.erase();
+      if (text) output.write(`${toneColor(tone)(text)} ${colors.faint(elapsed)}\n`);
     },
   };
 }
@@ -74,8 +100,9 @@ export function createSpinner({ output = process.stdout } = {}) {
  *
  * @returns {Promise<{ok:boolean, value?:any, error?:Error, cancelled:boolean}>}
  */
-export async function runWithSpinner(label, task, { listen = true, input = process.stdin, output = process.stdout, signal: externalSignal = null } = {}) {
-  const spinner = createSpinner({ output });
+export async function runWithSpinner(label, task, { listen = true, input = process.stdin, output = process.stdout, signal: externalSignal = null, screen = undefined } = {}) {
+  const target = screen === null ? null : screen ?? Screen.current;
+  const spinner = createSpinner({ output, screen: target });
   const controller = new AbortController();
   const cancellable = listen && input.isTTY && typeof input.setRawMode === "function";
 
@@ -85,11 +112,19 @@ export async function runWithSpinner(label, task, { listen = true, input = proce
     else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
   }
 
+  // Keys typed while the call runs are replayed into the next prompt (type-ahead),
+  // except the ones that drive the transcript: scrolling must work mid-call.
+  const decoder = createKeyDecoder({ mouse: Boolean(target) });
+  const forward = (raw) => {
+    for (const event of decoder.push(raw)) {
+      if (target && target.handleKey(event)) target.render();
+      else pushBytes(event.sequence ?? "");
+    }
+  };
+
   const onData = (chunk) => {
-    // Keep whatever the user types while the call runs: it is replayed into the
-    // next prompt. Ctrl+C cancels, a lone Escape cancels, arrow keys do not.
     const { cancel, rest } = splitCancelChunk(chunk.toString("utf8"));
-    if (rest) pushBytes(rest);
+    if (rest) forward(rest);
     if (cancel) {
       spinner.update(label, "cancelling… (Ctrl+C)");
       controller.abort(new Error("Cancelled by user"));
@@ -123,9 +158,15 @@ export async function runWithSpinner(label, task, { listen = true, input = proce
     externalSignal?.removeEventListener?.("abort", onExternalAbort);
     if (cancellable) {
       input.off("data", onData);
-      input.setRawMode(false);
+      if (!target) input.setRawMode(false);
       input.pause();
-      output.write(TERMINAL_MODES.leave);
+      // The screen owns the terminal modes for the whole session; a one-shot
+      // call (no screen) has to give bracketed paste / keyboard flags back.
+      if (!target) output.write(TERMINAL_MODES.leave);
+    }
+    if (target) {
+      for (const event of decoder.forceFlush()) pushBytes(event.sequence ?? "");
+      decoder.reset();
     }
   }
 }

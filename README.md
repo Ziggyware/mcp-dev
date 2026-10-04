@@ -138,8 +138,12 @@ Every match in the completion menu says what it will do, previews what Enter wil
 | Esc | Clear the current line (Ctrl+Y restores it); on an empty line it leaves the prompt. |
 | Ctrl+C | Cancel the line or the in-flight call; press it twice in a row to leave the session. |
 | Ctrl+D | Exit on an empty line. |
+| PgUp / PgDn | Scroll the transcript a page. Works in every state, including while a call is running and while a menu is open. |
+| Shift+↑ / Shift+↓ | Scroll the transcript one line. |
+| Ctrl+Home / Ctrl+End | Jump to the beginning of the session / back to the newest output. |
+| Mouse wheel | Scroll the transcript (`/mouse off` restores the terminal's own drag-to-select). |
 
-The prompt keeps the terminal in a single raw-mode pipeline (a key decoder, a line-editor model, and an inline frame that repaints only its own rows), so no full-screen alternate buffer is used and the scrollback stays intact.
+The session paints a full-screen surface: a status bar on the first row, the transcript in the middle, and the input block pinned at the bottom. Every line the session prints — results, errors, command output — is appended to that transcript, so a repaint can never overwrite a value you are reading, and the whole session stays reachable with PgUp/PgDn, Shift+↑/↓, Ctrl+Home/End, or the wheel. The transcript is the session's own copy, so scrolling works even where the terminal has no scrollback (tmux copy-mode, `script`, CI captures, Windows conhost); the alternate buffer keeps your shell history untouched, and leaving the session restores it.
 
 ### Approvals, once
 
@@ -331,8 +335,21 @@ This release implements the following specific changes, rather than relying on a
 36. **Added an input guide** (`/help`, `/keys`, or `?`) that lists every input mode, key, command, and approval scope inside the session.
 37. **Kept the scrollback clean** with an inline frame that repaints only its own rows, no alternate-screen buffer, and transient status messages that expire instead of piling up.
 38. **Taught the app to recover from cancelled work**: after Esc or Ctrl+C the prompt accepts input immediately, history and pending completions are reset, and a second Ctrl+C exits.
-39. **Added regression coverage for the whole input stack** — key decoding (including private CSI and paste), the line-editor model, fuzzy ranking, the JSON editor, back-reference paths, approvals, router classification and completion, plus a real pty test that drives the session's connect → form → approval → result flow.
-40. **Fixed `npm test` hanging**: bare `node --test` executes every file under `test/`, including the long-running stdio fixture, so the script now targets `test/*.test.js`.
+39. **Stopped a fast Enter from being read as a newline.** The key decoder marked every key in a read of more than four bytes as a "burst", so typing `abc` and Enter quickly inserted a newline instead of running the line — which is why Enter (and Enter after Tab) sometimes appeared to need a second press. A burst now means only what it says: a block of lines (a multi-line paste).
+40. **Added regression coverage for the whole input stack** — key decoding (including private CSI and paste), the line-editor model, fuzzy ranking, the JSON editor, back-reference paths, approvals, router classification and completion, plus a real pty test that drives the session's connect → form → approval → result flow.
+41. **Fixed `npm test` hanging**: bare `node --test` executes every file under `test/`, including the long-running stdio fixture, so the script now targets `test/*.test.js`.
+
+## The screen pass
+
+The session's input surface was rebuilt around a full-screen transcript. The complaints behind it, and what changed:
+
+42. **The caret now sits on the input line**, not on the first row of the frame: the caret row is derived from the block that is actually drawn, including title lines and menu height.
+43. **Selecting a menu item no longer shifts the screen.** Every row is redrawn from the model with absolute cursor moves, and the scroll offset is re-anchored when the input block changes height, so arrowing through a menu repaints only the highlighted rows.
+44. **One Tab and one Enter act.** The decoder no longer turns a trailing Enter into a newline (see 39), and completion/tab handling flushes the pending completion before acting.
+45. **Fast typing is never dropped.** Keys that arrive in the same read as the key that finished a prompt (Enter, Ctrl+C) are queued and replayed into the next prompt, so a quick double Ctrl+C exits and text typed ahead is preserved.
+46. **The screen is used in full.** Status bar on the first row, transcript above the input block, hint line on the last row; the input block is capped at ~60% of the height so a long approval can never swallow the transcript.
+47. **Results are never painted over.** Everything the session prints goes into its own scrollable transcript (stdout and `console.*` are captured while the screen is active), and a result taller than the view opens at its first line.
+48. **Scrollback is real and works everywhere.** PgUp/PgDn, Shift+↑/↓, Ctrl+Home/End, and the wheel scroll the transcript; the status bar shows how far below the view the newest output is.
 
 ## Development
 

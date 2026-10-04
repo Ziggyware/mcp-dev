@@ -105,7 +105,7 @@ export async function promptPathValue({
     history,
     menuSize: 8,
     status: { text: `Enter accepts · Tab completes · ~ and relative paths resolve against ${displayPath(baseDir, { baseDir })}`, tone: "info" },
-    completions: async (text) => {
+    completions: (text) => {
       const trimmed = text.trim();
       if (!trimmed) {
         const entries = readDirectory(baseDir) ?? [];

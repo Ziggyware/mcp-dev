@@ -120,7 +120,7 @@ async function promptEnumField({ key, schema, isRequired, header, footer }) {
     menuSize: 8,
     footer,
     status: { text: "↑/↓ choose · Enter accept · Esc cancel", tone: "info" },
-    completions: async (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
+    completions: (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["↑/↓ choose", "Enter accept", "Shift+Tab back", "Esc cancel"],
     onShiftTab: backHandler,
   });
@@ -139,7 +139,7 @@ async function promptBooleanField({ key, schema, isRequired, header, footer, def
     menuSize: 4,
     footer,
     status: { text: "↑/↓ choose · Enter accept · Esc cancel", tone: "info" },
-    completions: async (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
+    completions: (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["↑/↓ choose", "Enter accept", "Shift+Tab back", "Esc cancel"],
     onShiftTab: backHandler,
   });
@@ -191,7 +191,7 @@ async function promptScalarField({ key, schema, isRequired, resultBuffer, header
     status: resultBuffer?.list().length
       ? { text: `type ! to reuse a cached result (${resultBuffer.list().length} available)`, tone: "info" }
       : null,
-    completions: async (text) => {
+    completions: (text) => {
       const trimmed = String(text ?? "").trim();
       if (!resultBuffer || !trimmed.startsWith("!")) return { items: [] };
       return { items: cachedRefItems(resultBuffer, trimmed) };
