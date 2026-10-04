@@ -1,323 +1,250 @@
 # mcp-dev
 
-A local CLI for registering Model Context Protocol (MCP) servers and interacting with their tools — either directly via schema-guided prompts, or through an LLM-driven agentic loop with human confirmation on every tool call.
+`mcp-dev` is a fast, approval-first command-line client for [Model Context Protocol](https://modelcontextprotocol.io/) servers. Register local stdio processes or Streamable HTTP endpoints, inspect their tools, run one tool with guided arguments, or work in a persistent interactive session.
 
-## Table of Contents
+It is designed to make the safe path quick: **every tool call is shown with its exact arguments and requires approval**. `--args`, `--args-file`, JSON output, agent mode, and the session UI do not bypass that gate.
 
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Installation](#installation)
-- [Configuration](#configuration)
+> This release aims for a particularly capable and dependable MCP CLI; “better than every existing client” is not an objectively testable claim. The concrete reliability and usability work is listed in [Twenty improvements](#twenty-concrete-improvements).
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
 - [Commands](#commands)
-  - [`register`](#register-name)
-  - [`unregister`](#unregister-name)
-  - [`list`](#list)
-  - [`tools`](#tools-server)
-  - [`call`](#call-server-tool)
-  - [`ask`](#ask-query)
-  - [`session`](#session)
-  - [`doctor`](#doctor)
-- [Session Commands Reference](#session-commands-reference)
-- [Result Reuse (`!N` back-references)](#result-reuse-n-back-references)
-- [Design Decisions](#design-decisions)
-- [Platform Notes](#platform-notes)
-- [Security Model](#security-model)
-- [Known Limitations](#known-limitations)
+- [Interactive session](#interactive-session)
+- [Configuration](#configuration)
+- [Tool metadata cache and startup speed](#tool-metadata-cache-and-startup-speed)
+- [Result reuse](#result-reuse)
+- [Security](#security)
+- [Twenty concrete improvements](#twenty-concrete-improvements)
 - [Development](#development)
 
-## Overview
+## Install
 
-`mcp-dev` connects to MCP servers over either `stdio` (a locally spawned process) or `http` (a remote streamable-HTTP endpoint), discovers their tools via the standard MCP `listTools`/`callTool` protocol, and exposes three ways to invoke those tools:
-
-1. **`call`** — you pick the tool, the CLI walks its JSON Schema and prompts you field-by-field.
-2. **`ask`** — you describe what you want in natural language; Claude selects tools, drafts arguments, and the CLI executes them with your explicit approval on each call, looping until it has a final answer.
-3. **`session`** — an interactive REPL wrapping both of the above, where server connections, `ask` conversation history, and cached tool results (see [Result Reuse](#result-reuse-n-back-references)) all persist across commands instead of resetting on every invocation.
-
-## Architecture
-
-```
-src/
-  config.js        Registered-server persistence (~/.mcp-dev/servers.json)
-  mcpClient.js      MCP transport handling: connect, list tools, call tools, teardown,
-                     env-var interpolation for stdio server secrets
-  suggest.js        JSON Schema -> interactive prompt walker; LLM agent-loop driver
-  render.js         Result formatting: JSON pretty-print, auto-table for flat arrays
-                     of objects, pager fallback for long output
-  resultBuffer.js   Session-scoped cache of tool results + "!N" back-reference resolver
-  session.js        Interactive REPL: persistent connections + persistent conversation
-                     + persistent result buffer
-  index.js          Commander CLI entrypoint wiring the above into subcommands
-```
-
-**Data flow for `ask`:**
-
-```
-user query
-   -> runAgentTurn() appends to shared `messages` history
-   -> Anthropic API call with full tool set + full message history
-   -> model returns text and/or tool_use blocks
-   -> for each tool_use: confirmTool() gates execution, executeTool() runs it via MCP
-   -> results appended as tool_result blocks (and, in `session`, cached in the
-      result buffer alongside palette-driven calls), loop repeats
-   -> terminates when model returns a turn with no tool_use blocks,
-      or after MAX_AGENT_STEPS (8) steps, whichever comes first
-```
-
-This is a standard Anthropic tool-use loop, not a single "pick one tool and stop" call — the model can chain multiple tool calls (read a file, then act on its contents) within one `ask`, and in `session` mode it retains memory of prior `ask` turns in the same run.
-
-## Installation
-
-Requires Node.js 18+.
-
-```bash
-mkdir mcp-dev && cd mcp-dev
-# place src/config.js, src/mcpClient.js, src/suggest.js, src/render.js,
-# src/resultBuffer.js, src/session.js, src/index.js
-```
-
-**`package.json`:**
-
-```json
-{
-  "name": "mcp-dev",
-  "version": "0.1.0",
-  "description": "Local CLI agent for calling registered MCP servers",
-  "type": "module",
-  "bin": {
-    "mcp-dev": "./src/index.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.0",
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "commander": "^12.1.0",
-    "inquirer": "^12.0.0"
-  }
-}
-```
-
-`"type": "module"` is required — every file uses ES module `import`/`export` syntax. `inquirer` must be v9 or later (pure ESM); older CommonJS versions have a different default-export shape than what this code assumes. The array/object argument editor (see [Known Limitations](#known-limitations)) uses `editor` from `@inquirer/prompts`, already a transitive dependency of `inquirer@12` — no new package is required.
+Requires Node.js 18 or newer.
 
 ```bash
 npm install
-npm link          # exposes `mcp-dev` as a global command
+npm link
+mcp-dev --help
 ```
 
-To remove the global link later:
+The CLI has no build step. `mcp-dev --help` and `mcp-dev help <command>` intentionally avoid loading the MCP SDK, prompt engine, or configured servers, so help is available immediately even in a cold shell.
+
+## Quick start
+
+### Register a local server
 
 ```bash
-cd mcp-dev
-npm unlink -g
-# or, if that doesn't take:
-npm uninstall -g mcp-dev
+mcp-dev register files \
+  --command npx \
+  --arg -y \
+  --arg @modelcontextprotocol/server-filesystem \
+  --arg "$HOME/work"
 ```
 
-## Configuration
-
-Registered servers are stored as plain JSON at:
-
-```
-~/.mcp-dev/servers.json
-```
-
-Created automatically on first use. Structure:
-
-```json
-{
-  "servers": {
-    "my-http-server": { "url": "https://example.com/mcp" },
-    "my-stdio-server": {
-      "command": "node",
-      "args": ["server.js"],
-      "cwd": "/path/to/server",
-      "env": { "API_KEY": "${MY_API_KEY}" },
-      "inheritEnv": false
-    }
-  }
-}
-```
-
-An `env` value of exactly `${VAR_NAME}` is resolved from your shell environment at connect time instead of being read literally — see [Security Model](#security-model). Values that don't match that exact pattern are used as-is, so existing configs with literal secret values keep working unchanged.
-
-## Commands
-
-### `register <name>`
-
-Interactively registers a new server. Prompts for transport (`stdio` or `http`), then transport-specific fields:
-
-- **http**: server URL.
-- **stdio**: command, space-separated arguments, working directory, extra environment variables (`KEY=VALUE`, comma-separated — use `KEY=${SHELL_VAR}` to store a reference instead of a literal secret), and whether to inherit your full shell environment.
+Or use the guided registration flow:
 
 ```bash
-mcp-dev register fs_tools
+mcp-dev register files
 ```
 
-### `unregister <name>`
-
-Removes a server from the config file.
+`--args` understands quoted values without executing a shell:
 
 ```bash
-mcp-dev unregister fs_tools
+mcp-dev register docs --command node --args 'server.mjs --root "~/My Docs"'
 ```
 
-### `list`
-
-Lists all registered servers and their launch command or URL.
+### Inspect and call it
 
 ```bash
 mcp-dev list
+mcp-dev tools files
+mcp-dev call files read_file
 ```
 
-### `tools <server>`
-
-Connects to a server and prints every tool it exposes, along with its parameters, required/optional status, and types, derived from each tool's JSON Schema.
+For reproducible input, pass one complete JSON object. Approval is still required:
 
 ```bash
-mcp-dev tools fs_tools
-mcp-dev tools fs_tools --json   # raw tool definitions, for piping into jq etc.
+mcp-dev call files read_file --args '{"path":"README.md"}'
+mcp-dev call files read_file --args-file request.json --dry-run
 ```
 
-### `call <server> <tool>`
-
-Connects, walks the target tool's input schema, prompting for each parameter (respecting `enum`, `boolean`, `number`/`integer`, `array`/`object`, and required/optional fields), shows you the assembled arguments, and asks for confirmation before executing. Results are rendered as a colorized/tabular view by default, or as raw JSON with `--json`.
-
-```bash
-mcp-dev call fs_tools read_file
-mcp-dev call fs_tools list_dir --json   # confirmation prompt still applies — see Security Model
-```
-
-### `ask <query...>`
-
-Natural-language dispatch. Connects to every registered server (or one, with `-s <name>`), gives Claude the full combined tool set, and runs the agent loop described in [Architecture](#architecture). Requires `ANTHROPIC_API_KEY` in the environment.
-
-```bash
-mcp-dev ask "list the files in the temp directory and tell me the largest one"
-mcp-dev ask -s fs_tools "clean up any .tmp files"
-```
-
-Every tool call the model proposes is printed with its full arguments and requires an explicit `y`/`n` before execution — the loop does not run tools autonomously.
-
-### `session`
-
-Starts an interactive REPL. Connections opened with `connect` (or lazily by `tools`/`call`/`ask`) stay open across commands, `ask`'s conversation history accumulates for the lifetime of the session instead of resetting per call, and every tool result — from a palette-driven call or from the agent loop — is cached and reusable via `!N` (see [Result Reuse](#result-reuse-n-back-references)).
+### Start a session
 
 ```bash
 mcp-dev session
 ```
 
-### `doctor`
+The session starts without connecting to every server. Type `/files/` to lazy-connect and browse a server, or type a normal sentence to chat after setting `ANTHROPIC_API_KEY`.
 
-Connects to every registered server, counts its tools, times the connection, and disconnects — without executing any tool. Useful to catch a broken registration (bad command, missing env var, unreachable URL) before starting a session, or as a pre-flight check in CI.
+## Commands
+
+Run `mcp-dev help <command>` for focused examples, options, and keyboard notes.
+
+| Command | What it does |
+|---|---|
+| `register <name>` | Register a stdio command or Streamable HTTP endpoint; interactive or flag-driven. |
+| `unregister <name>` | Remove a registration. Interactive terminals ask first; automation needs `--force`. |
+| `list` | List registrations. `--plain` is script-friendly; `--json` is a redacted safe summary. |
+| `tools <server>` | Show readable parameter schemas. Supports `--json`, `--plain`, and cache-only `--cached`. |
+| `call <server> <tool>` | Guided, schema-validated tool call with confirmation. Supports `--args`, `--args-file`, `--dry-run`, `--json`, and `--no-pager`. |
+| `ask <query...>` | Approval-gated multi-step agent loop using `ANTHROPIC_API_KEY`; use `-s <server>` to restrict it. |
+| `session [--warm]` | Persistent interactive workspace. `--warm` eagerly refreshes every registration. |
+| `doctor` | Parallel non-destructive health check. Supports timeout, concurrency, and JSON output. |
+| `completion <shell>` | Generate Bash, Zsh, or PowerShell completion. |
+
+Useful examples:
 
 ```bash
-mcp-dev doctor
+mcp-dev tools files --plain
+mcp-dev tools files --cached        # never opens a process or network connection
+mcp-dev doctor --concurrency 8
+mcp-dev doctor --json | jq '.[] | select(.ok == false)'
+mcp-dev completion zsh > "${fpath[1]}/_mcp-dev"
 ```
 
-```
-✓ fs_tools    6 tool(s)   142ms
-✗ broken_srv              8ms   Server "broken_srv": env var "API_KEY" references ${MISSING_VAR}, which is not set in your shell.
-```
+## Interactive session
 
-Disclosed limitation: there is no per-server timeout. A server that connects but hangs on `listTools()` will make `doctor` hang on that entry rather than reporting a timeout for it.
+The session has three input modes:
 
-## Session Commands Reference
-
-| Command | Description |
+| Input | Meaning |
 |---|---|
-| `connect <server>` | Opens (or reuses) a connection to a registered server |
-| `disconnect <server>` | Closes a specific connection |
-| `servers` | Lists registered servers, marking which are currently connected |
-| `tools <server>` | Lists a server's tools (auto-connects if needed) |
-| `call <server> <tool>` | Schema-guided tool call, same prompting as the top-level `call` command |
-| `ask <query>` | Runs the agent loop against the shared conversation history |
-| `results` | Lists cached tool results and their `!N` index (see below) |
-| `save <n> <path>` | Writes cached result `#n`'s raw text to a file on disk |
-| `history` | Prints the raw `ask` message history as JSON |
-| `clear` | Wipes conversation history without closing connections or clearing cached results |
-| `exit` / `quit` | Closes all connections and ends the session |
+| Plain text | Chat with the assistant. Requires `ANTHROPIC_API_KEY`. |
+| `/command` | Run a built-in command, such as `/servers`, `/call`, `/refresh`, or `/help`. |
+| `/server/` or `/server/tool` | Lazy-connect, inspect, and select a tool. The legacy `server/tool` spelling also works. |
+| `//message` | Send a chat message that literally begins with `/`. |
 
-## Result Reuse (`!N` back-references)
+`/help` displays the full in-session reference. Direct session calls and model-proposed calls both show an approval screen before execution.
 
-Every tool call inside a `session` — whether picked from the `/` palette or run by the agent loop during `ask` — is cached in an in-memory ring buffer (last 20 results). The index shown after each call (`[cached as #7]`) can be substituted directly into a later argument prompt instead of re-typing or copy-pasting a value:
+### Keyboard behavior
 
-- `!!` — the most recent result's full text.
-- `!7` — result #7's full text.
-- `!7.items[0].id` — a single field extracted from result #7, if it parsed as JSON. Supports dotted keys and `[n]` array indices only — no wildcards, filters, or slices.
+Text fields and fuzzy search prompts support word deletion consistently:
 
-```
-> fs_tools/list_dir
-[cached as #1 — reference with !1 or !!]
-...
-> fs_tools/read_file
-path (required): !1.entries[0].path
+- **Ctrl+Backspace** — delete the previous word in terminals that report that key combination.
+- **Alt/Option+Backspace** — supported where the terminal maps it to Meta+Backspace.
+- **Ctrl+W** — portable terminal fallback for delete-previous-word.
+- **Ctrl+C** — cancel the active prompt or in-flight MCP request.
+
+The implementation normalizes the key event before Node’s readline handler runs, so it avoids the one-character deletion behavior seen in several Windows terminal setups.
+
+## Configuration
+
+By default, registrations are stored at:
+
+```text
+~/.mcp-dev/servers.json
 ```
 
-For `array`/`object`-typed parameters, the same `!N`/`!N.path` syntax works on the parameter's one-line prompt; leaving it blank opens your `$EDITOR` (falls back to `notepad` on Windows, `vim` elsewhere) pre-filled with a JSON skeleton — see [Known Limitations](#known-limitations).
+Use an alternate location for a project, test, or CI job:
 
-Disclosed failure mode: a literal argument value that itself starts with `!` followed by `!` or digits (a shell-command string, an actual ticket ID like `!123`) will be misread as a back-reference. There's no escape syntax for this yet — route around it via the editor path if it collides with a specific tool's argument values.
+```bash
+MCP_DEV_CONFIG_DIR=.mcp-dev-local mcp-dev list
+# or
+MCP_DEV_CONFIG_PATH=/secure/path/servers.json mcp-dev list
+```
 
-The buffer is in-memory only and is not persisted — it's cleared when the session exits. `save <n> <path>` is the explicit, one-result-at-a-time way to persist a value to disk.
+Example configuration:
 
-## Design Decisions
+```json
+{
+  "servers": {
+    "files": {
+      "command": "node",
+      "args": ["server.mjs", "--root", "/workspace"],
+      "cwd": "/workspace",
+      "root": "/workspace",
+      "env": { "API_KEY": "${FILES_API_KEY}" },
+      "inheritEnv": false,
+      "allowSampling": false,
+      "description": "workspace filesystem"
+    },
+    "remote-docs": {
+      "url": "https://example.test/mcp",
+      "headers": { "Authorization": "${DOCS_AUTH}" },
+      "description": "company documentation"
+    }
+  }
+}
+```
 
-**Human confirmation on every tool call, in both `ask` and `session ask`.**
-The agent loop can chain multiple tool invocations per query. Autonomous execution without per-call approval was deliberately rejected — a registered server can have destructive tools (e.g. file deletion), and a multi-step loop compounds that risk with every additional step. `confirmTool` is called before every single tool execution, not once per query. `call --json` and `tools --json` only change output *formatting*; neither adds a way to skip this gate.
+An `env` or `headers` value that is exactly `${NAME}` is resolved from the current environment only when the server connects. For example, set `DOCS_AUTH` to the full `Bearer …` value and store `"Authorization": "${DOCS_AUTH}"`. Partial interpolation is intentionally not supported. Use `--inherit-env` only for processes you fully trust.
 
-**`MAX_AGENT_STEPS = 8`.**
-Bounds the tool-call loop so a model that gets stuck re-invoking a tool (e.g. misinterpreting a result and retrying indefinitely) cannot run unbounded. If the cap is hit, the loop returns an explicit "stopped after N steps" message rather than either looping forever or failing silently.
+Server-initiated MCP sampling is **off by default**. Set `"allowSampling": true` (or register with `--allow-sampling`) only for a trusted server and a session where sending server-provided sampling content to your configured model provider is acceptable.
 
-**`tool_choice: "auto"`, not `"any"`.**
-An earlier iteration forced the model to always select some tool, even for queries that didn't clearly need one. `"auto"` lets the model return plain text when no tool call is warranted.
+Configuration writes use an advisory lock, stale-lock recovery, an atomic rename, and best-effort `0700` directory / `0600` file permissions on POSIX systems. The config remains plaintext; permissions reduce accidental exposure but do not encrypt secrets.
 
-**Explicit `env` allowlist rather than full environment inheritance by default.**
-Spawned stdio servers get a minimal, deliberately chosen set of environment variables (`PATH`, `HOME`/`USERPROFILE`, temp dirs, shell/command-processor variables) unless `inheritEnv: true` is set on that server's registration. Full inheritance is opt-in per server, not global, since it exposes whatever is in the invoking shell (API keys, tokens, etc.) to every spawned child process.
+## Tool metadata cache and startup speed
 
-**`${VAR_NAME}` env interpolation is exact-match, not substring interpolation.**
-`env: { "API_KEY": "${MY_KEY}" }` resolves; `env: { "URL": "https://x/${MY_KEY}/y" }` does not (the whole value must match the pattern). This keeps the resolution rule simple to reason about and audit, at the cost of not supporting partial-value templating — a deliberate scope limit, not an oversight.
+After a successful `tools`, `doctor`, `ask`, or session refresh, tool definitions are cached in `~/.mcp-dev/tools.json` (or next to a custom config file). The cache enables:
 
-**Explicit client teardown, not reliance on process exit.**
-Every command path — success, early failure, and unhandled throw (via the `withCleanup` wrapper) — calls `closeAllClients()` before exiting. Letting `process.exit()` implicitly kill spawned children is not reliable across platforms, particularly Windows (see below).
+- instant session startup without launching every stdio server;
+- cached tool names for Bash/Zsh/PowerShell completion;
+- `mcp-dev tools server --cached` with no network/process startup;
+- graceful reuse of last-known schemas while a server is temporarily unavailable.
 
-**Result buffer is in-memory and session-scoped, not persisted by default.**
-A tool result can contain data the user never asked to have written to disk. `save <n> <path>` is opt-in per result; nothing is written automatically.
+The cache is fingerprinted to the meaningful server configuration, bounded in size, and written atomically with restrictive file permissions. It persists tool names, descriptions, and schemas—not tool-call results—so treat it as configuration-adjacent data. A cached selection is always live-refreshed before the session displays its argument form or calls it. MCP `notifications/tools/list_changed` invalidates the cache for that open connection.
 
-## Platform Notes
+Use `mcp-dev session --warm` when you prefer an eager refresh, or `/refresh` inside a session for one server.
 
-**Windows `stdio` command resolution.** The MCP SDK's `StdioClientTransport` spawns processes without a shell layer. Windows resolves commands like `npx`, `npm`, or `pnpm` to `.cmd` shims via `PATHEXT`, which a shell-less `CreateProcess` call cannot do — it throws `ENOENT`. `mcp-dev` detects `process.platform === "win32"` and, for any command that isn't already a path or doesn't already carry an executable extension (`.exe`/`.cmd`/`.bat`/`.com`), routes the launch through `cmd.exe /d /s /c <command> <args...>` to restore normal shim resolution.
+## Result reuse
 
-This routing is not a general-purpose shell-injection-safe quoting layer — arguments containing embedded double quotes or `&`/`|`/`^` can still be misparsed by `cmd.exe`'s own quoting rules. For typical MCP server arguments (flags, file paths) this does not come up; it is a known residual limitation, not an oversight.
+Session results stay in an in-memory ring buffer (20 entries). Use them as subsequent argument values:
 
-**Windows child process cleanup.** Unlike POSIX, where a child often exits on `SIGPIPE` when its parent's stdin closes, Windows gives no such guarantee. Every command explicitly calls `client.close()` (via `closeAllClients()`) before exiting rather than relying on this behavior.
+```text
+!!                         latest result text
+!7                         result #7 text
+!7.items[0].id             a JSON field
+!7["key.with.dots"][0]    a quoted JSON key
+!7.rows[*].name            values projected from an array
+\!123                      literal !123, not a back-reference
+```
 
-**Result pager (`less`).** Long, non-JSON-parseable results are piped through `less -R -F` when stdout is a TTY. `less` ships by default on macOS/Linux. On a bare Windows `cmd.exe`/PowerShell host without Git-for-Windows or WSL, `less` may be absent — this is not confirmed either way on every Windows configuration; if the pager binary is missing, output falls back to a plain, unpaginated `console.log` with a one-time notice rather than failing the command.
+`/results` lists cache indices. `/save` writes one selected result after an overwrite confirmation. The buffer clears when the session exits and is never persisted automatically.
 
-## Security Model
+## Security
 
-- `~/.mcp-dev/servers.json` is **plaintext**. Any `env` values you register as literal strings (API keys, tokens) are stored and read unencrypted. No permission-hardening is applied to the file beyond your OS's default umask. Using `${VAR_NAME}` instead of a literal value (see [Configuration](#configuration)) keeps the secret itself out of this file — only the variable *name* is stored — but this does not encrypt or otherwise protect entries that are still literal.
-- A `${VAR_NAME}` reference to an unset shell variable throws a clear, per-server error at connect time rather than silently passing an empty string to the spawned process.
-- `inheritEnv: true` passes your **entire** shell environment to the spawned server process. Only enable it for servers you trust with everything currently in your environment.
-- Every tool call proposed by the LLM in `ask`/`session ask`, and every tool call made via `call`/`session call` (`--json` included), requires explicit interactive confirmation, showing the exact tool name, server, and arguments before execution. There is no `--yes`/auto-approve flag; this is intentional, and `--json` deliberately does not add one — it only changes how the *result* is printed after you've already confirmed.
-- `ANTHROPIC_API_KEY` is read from the environment only — it is never written to the config file or logged.
-- The result buffer (`session` only) lives in process memory and is never written to disk unless you explicitly run `save <n> <path>`.
+- Every MCP tool invocation requires an explicit confirmation, including agent and session calls.
+- Tool errors render visibly and make one-shot `call` return a non-zero status.
+- URLs shown by `list` redact credentials and sensitive query keys. The safe `list --json` summary excludes environment values and HTTP headers.
+- Stdio servers receive a minimal environment by default. `inheritEnv: true` is an explicit opt-in.
+- HTTP header values can use exact `${ENV_VAR}` references to keep tokens out of configuration.
+- Server-initiated sampling is not advertised unless `allowSampling` is explicitly enabled for that server.
+- Server stderr is captured in a bounded buffer and surfaced on startup failure, making broken stdio registrations diagnosable without flooding output.
+- `--dry-run` validates and prints a tool request without invoking it; there is deliberately no `--yes` / auto-approve execution flag.
 
-## Known Limitations
+## Twenty concrete improvements
 
-- **`array`/`object`-typed schema properties open an external editor (`$EDITOR`/`$VISUAL`, falling back to `notepad` on Windows or `vim` elsewhere), pre-filled with a JSON skeleton, `!N` back-reference, or your last invalid attempt.** This replaces the previous plain-string fallback, but the scope is deliberately narrow: it makes producing valid JSON easier, it does not add field-by-field sub-schema prompting for nested object shapes. A tool with a deeply nested required object still requires hand-written JSON, just in a real editor instead of a single-line terminal prompt.
-- **No retry/reconnect logic.** One live connection per server per process (or per `session` run); a server that crashes mid-session must be reconnected manually with `connect <server>`.
-- **No validation beyond type coercion.** Schema constraints like `minimum`/`maximum`/`pattern` are not enforced client-side; a rejected value will surface as an MCP server-side error rather than being caught earlier.
-- **`!N` back-reference syntax can collide with literal argument values** that start with `!` followed by digits or `!` (see [Result Reuse](#result-reuse-n-back-references)).
-- **`doctor` has no per-server timeout**; a hung server hangs the whole `doctor` run at that entry.
-- **The result buffer is not shared between `session` and one-shot `call`/`ask` invocations** — each one-shot process starts with an empty buffer, since there is no persistent process for it to live in.
+This release implements the following specific changes, rather than relying on a broad quality claim:
+
+1. **Fixed the Linux-breaking `resultBuffer` filename/import case mismatch** and added a regression-tested result path parser.
+2. **Added Ctrl+Backspace, Alt/Option+Backspace, and Ctrl+W word deletion** to text and fuzzy-search prompts.
+3. **Made root, command, and version help fast-paths**, avoiding heavy MCP imports for help.
+4. **Replaced terse help with contextual command help**, examples, safety notes, and keyboard guidance.
+5. **Made sessions lazy by default**, so startup does not serially connect every registration.
+6. **Added a bounded, fingerprinted tool-metadata cache** for fast startup and offline inspection.
+7. **Revalidate cached schemas before a session call** and invalidate them on MCP tool-list-change notifications.
+8. **Deduplicated simultaneous session connections** so one server creates at most one in-flight child process.
+9. **Bounded paginated `tools/list` responses** to reject repeated cursors and pathological tool counts.
+10. **Added connect/list/call deadlines and jittered transient retries**, so one dead server does not stall the CLI indefinitely.
+11. **Made `doctor` concurrent, timed, JSON-capable, and CI-meaningful** with a non-zero status on failure.
+12. **Hardened configuration writes** with directory creation before locking, stale-lock recovery, atomic renames, and restrictive permissions.
+13. **Added portable config locations** through `MCP_DEV_CONFIG_DIR` and `MCP_DEV_CONFIG_PATH`.
+14. **Added shell-like argument parsing and non-interactive registration flags** without running a shell.
+15. **Added cached dynamic completion for tool names** so tab completion does not start servers or contact endpoints.
+16. **Added `--args`, `--args-file`, and `--dry-run`** for reproducible direct calls while retaining approval.
+17. **Improved argument UX and correctness** with direct dependencies, JSON Schema validation, typed enums, optional booleans, constraints, and retries.
+18. **Closed the session confirmation gap**: palette and `/call` tool invocations now require the same explicit approval as one-shot calls.
+19. **Fixed agent tool namespace dispatch** so encoded model tool IDs resolve back to the original server/tool names; agent results now enter the result buffer.
+20. **Added safer remote-server controls**: URL redaction, safe list JSON, `${ENV}` headers, opt-in MCP sampling, and bounded server-stderr diagnostics.
 
 ## Development
 
 ```bash
-npm link                       # develop against the global `mcp-dev` command
-npm unlink -g                  # remove when done
-node ./src/index.js            #executes the app
-node ./src/index.js session    #executes the app in session mode
+npm ci
+npm test
+npm run check
+npm run smoke
 ```
 
-There is no bundler or build step — `src/index.js` runs directly via its `#!/usr/bin/env node` shebang (POSIX) or the `.cmd` shim `npm link` generates (Windows).
+The test suite covers quoted argument parsing, configuration safety, fast help, Ctrl+word-delete behavior, result back-reference paths, schema validation, agent tool-name dispatch, and bounded tool pagination.

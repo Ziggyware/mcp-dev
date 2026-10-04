@@ -35,8 +35,9 @@ export class ResultBuffer {
     return [...this.entries];
   }
 
-  clear() {
+  clear({ resetIndex = true } = {}) {
     this.entries = [];
+    if (resetIndex) this.nextIndex = 1;
   }
 }
 
@@ -66,7 +67,12 @@ class PathParser {
   }
 
   parse() {
-    const segments = [{ type: "key", name: this.parseKey() }];
+    const segments = [];
+    if (this.peek() === "[") {
+      segments.push(this.parseSegment());
+    } else {
+      segments.push({ type: "key", name: this.parseKey() });
+    }
     while (!this.atEnd()) {
       segments.push(this.parseSegment());
     }
@@ -94,12 +100,35 @@ class PathParser {
       this.pos++;
       return { type: "wildcard" };
     }
+
+    if (this.peek() === "\"" || this.peek() === "'") {
+      const quote = this.peek();
+      this.pos++;
+      let name = "";
+      while (!this.atEnd() && this.peek() !== quote) {
+        const char = this.peek();
+        this.pos++;
+        if (char === "\\") {
+          if (this.atEnd()) this.error("unfinished escape in quoted key");
+          const escaped = this.peek();
+          this.pos++;
+          const escapes = { n: "\n", r: "\r", t: "\t", "\\": "\\", "\"": "\"", "'": "'" };
+          name += escapes[escaped] ?? escaped;
+        } else {
+          name += char;
+        }
+      }
+      if (this.peek() !== quote) this.error("unterminated quoted key");
+      this.pos++;
+      return { type: "key", name };
+    }
+
     const start = this.pos;
     if (this.peek() === "-") this.pos++;
     const digitsStart = this.pos;
     while (!this.atEnd() && /[0-9]/.test(this.peek())) this.pos++;
     if (this.pos === digitsStart) {
-      this.error("expected a numeric index or \"*\" inside [...]");
+      this.error("expected a numeric index, quoted key, or \"*\" inside [...]");
     }
     return { type: "index", value: Number(this.path.slice(start, this.pos)) };
   }
@@ -167,7 +196,8 @@ export function walkPath(value, path) {
   return walkSegments(value, segments, 0, path);
 }
 
-const BACKREF_RE = /^!(?:(!)|(\d+))(?:\.(.+))?$/;
+// Supports !7.name, !7[0], !7["key.with.dots"], and !! for the latest result.
+const BACKREF_RE = /^!(?:(!)|(\d+))((?:\..+|\[.+)?)$/;
 
 export function resolveBackref(raw, buffer) {
   const str = String(raw).trim();
@@ -177,27 +207,28 @@ export function resolveBackref(raw, buffer) {
   const m = BACKREF_RE.exec(str);
   if (!m) return { matched: false };
 
-  const [, bang, idxStr, path] = m;
+  const [, bang, idxStr, suffix] = m;
   const entry = bang ? buffer.last() : buffer.get(Number(idxStr));
   if (!entry) {
     return { matched: true, error: `No cached result for "${raw}". Run \`results\` to see what's available.` };
   }
 
-  if (!path) {
+  if (!suffix) {
     return { matched: true, value: entry.text, isString: true, sourceIndex: entry.index };
   }
 
+  const path = suffix.startsWith(".") ? suffix.slice(1) : suffix;
   let parsed;
   try {
     parsed = JSON.parse(entry.text);
   } catch {
-    return { matched: true, error: `Result #${entry.index} is not JSON -- cannot apply path ".${path}".` };
+    return { matched: true, error: `Result #${entry.index} is not JSON -- cannot apply path "${suffix}".` };
   }
 
   try {
     const value = walkPath(parsed, path);
     if (value === undefined) {
-      return { matched: true, error: `Path ".${path}" not found in result #${entry.index}.` };
+      return { matched: true, error: `Path "${suffix}" not found in result #${entry.index}.` };
     }
     return { matched: true, value, isString: typeof value === "string", sourceIndex: entry.index };
   } catch (err) {
