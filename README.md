@@ -13,6 +13,7 @@ It is designed to make the safe path quick: **every tool call is shown with its 
 - [Commands](#commands)
 - [Interactive session](#interactive-session)
 - [Configuration](#configuration)
+- [Connect the local .NET servers](#connect-the-local-net-servers)
 - [Tool metadata cache and startup speed](#tool-metadata-cache-and-startup-speed)
 - [Result reuse](#result-reuse)
 - [Security](#security)
@@ -173,6 +174,51 @@ An `env` or `headers` value that is exactly `${NAME}` is resolved from the curre
 Server-initiated MCP sampling is **off by default**. Set `"allowSampling": true` (or register with `--allow-sampling`) only for a trusted server and a session where sending server-provided sampling content to your configured model provider is acceptable.
 
 Configuration writes use an advisory lock, stale-lock recovery, an atomic rename, and best-effort `0700` directory / `0600` file permissions on POSIX systems. The config remains plaintext; permissions reduce accidental exposure but do not encrypt secrets.
+
+## Connect the local .NET servers
+
+The WordNet/Dolma MCP server and the ONNX `vector_tools` server can be used side by side with `mcp-dev` as two independent stdio servers. No project merge or shared vector index is needed: `mcp-dev` scopes each tool call by server name, even though both servers expose a tool named `embed_search`.
+
+The C# projects and their model/data files are external assets; this repository does not include them. Prepare the target frameworks and data paths first:
+
+- The WordNet project targets .NET 10 and requires an x64 CPU with AVX2, FMA3, and SSE2. It needs a WordNet `dict/` directory and the Dolma `.txt` corpus. In `WordNetMcp/app.config`, replace the sample Windows-only `StartupPath` with an existing, writable runtime/cache directory on this machine. The program changes its working directory to that setting before it starts; the generated `dolma_vectors.bin` is written there. It also accepts the dictionary, corpus, and sorted-index cache paths as application arguments, detected by their `dict`, `.txt`, and `.bin` suffixes. Edit this setting before building, or rebuild afterward so the output config is refreshed.
+- `vector_tools` targets .NET 8. It needs a compatible ONNX model and its `vocab.txt`, plus an existing writable directory for its persistent passage index. Its application arguments are model path, vocabulary path, and index root, in that order.
+- Install the .NET SDKs/runtimes needed for both target frameworks. Keep the large corpus, dictionary, model, and generated indexes outside this repository.
+
+Build each project separately before registering its DLL. This keeps `dotnet build` output away from the MCP stdio stream:
+
+```bash
+dotnet build "/path/to/WordNetMcp/WordNetMcp.csproj" -c Release
+dotnet build "/path/to/vector_tools/embedtools.csproj" -c Release
+```
+
+Register each built DLL (replace every `/path/to/...` with a real absolute path):
+
+```bash
+mcp-dev register wordnet-dolma --command dotnet --args '"/path/to/WordNetMcp/bin/Release/net10.0/WordNetMcp.dll" "/path/to/WordNetMcp/dict" "/path/to/dolma_300_2024_1.2M.100_combined.txt" "/path/to/dolma_sorted_index.bin"' --cwd "/path/to/WordNetMcp"
+
+mcp-dev register vector-tools --command dotnet --args '"/path/to/vector_tools/bin/Release/net8.0/embed-retrieval.dll" "/path/to/model.onnx" "/path/to/vocab.txt" "/path/to/embeddings"' --cwd "/path/to/vector_tools"
+```
+
+The quoted `--args` value is parsed into individual arguments without invoking a shell, so paths containing spaces remain intact. An equivalent ready-to-edit JSON template is at [`examples/dotnet-mcp-servers.json`](examples/dotnet-mcp-servers.json); merge its entries into your existing `servers` object rather than replacing registrations you want to keep.
+
+Inspect each server and allow more time on a cold start while .NET initializes or the Dolma cache is built:
+
+```bash
+mcp-dev list
+mcp-dev tools wordnet-dolma --timeout 120000
+mcp-dev tools vector-tools --timeout 120000
+mcp-dev doctor --timeout 120000 --json
+```
+
+Calls remain approval-gated. For example, these calls are unambiguous because the server name scopes each tool; WordNet lookups work before its embedding index is ready, while ONNX search queries the passage index:
+
+```bash
+mcp-dev call wordnet-dolma lemma_lookup --args '{"lemma":"bank"}'
+mcp-dev call vector-tools embed_search --args '{"query":"marine mammals","topK":5}'
+```
+
+Both servers also expose `embed_search`, but their vectors are different spaces (300 vs. 768 dimensions) and are not interchangeable. WordNet populates its Dolma index in the background. A one-shot `mcp-dev call` starts and closes a fresh server process, so use a persistent session for index-dependent WordNet tools: run `mcp-dev session`, type `/wordnet-dolma/`, select and approve `index_status`, and repeat until it reports `ready: true`. Then call `embed_search` or `semantic_expand_text` in that same session. Otherwise those tools can keep returning `NOT_READY` as each one-shot invocation restarts the background build.
 
 ## Tool metadata cache and startup speed
 

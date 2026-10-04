@@ -1,0 +1,26 @@
+{
+  "servers": {
+    "wordnet-dolma": {
+      "command": "dotnet",
+      "args": [
+        "/path/to/WordNetMcp/bin/Release/net10.0/WordNetMcp.dll",
+        "/path/to/WordNetMcp/dict",
+        "/path/to/dolma_300_2024_1.2M.100_combined.txt",
+        "/path/to/dolma_sorted_index.bin"
+      ],
+      "cwd": "/path/to/WordNetMcp",
+      "description": "WordNet lexical relations and 300-dimensional Dolma embeddings"
+    },
+    "vector-tools": {
+      "command": "dotnet",
+      "args": [
+        "/path/to/vector_tools/bin/Release/net8.0/embed-retrieval.dll",
+        "/path/to/model.onnx",
+        "/path/to/vocab.txt",
+        "/path/to/embeddings"
+      ],
+      "cwd": "/path/to/vector_tools",
+      "description": "ONNX 768-dimensional embedding and passage retrieval"
+    }
+  }
+}

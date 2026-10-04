@@ -9,6 +9,7 @@
   "files": [
     "src",
     "scripts",
+    "examples",
     "README.md",
     "inst_pwsh.ps1"
   ],
