@@ -119,3 +119,24 @@ test("session: a long result stays readable and the transcript scrolls over it",
     fs.rmSync(configDir, { recursive: true, force: true });
   }
 });
+
+test("session: Escape cancels a dialog and a quick double Ctrl+C still leaves", { skip: !hasScript, timeout: 60_000 }, async () => {
+  const configDir = makeConfigDir();
+  try {
+    const { code, visible } = await driveSession([
+      { waitScreen: /Type a sentence/, send: "/demo/" },
+      { waitScreen: /❯ \/demo\//, send: "\r" },
+      // The tool picker advertises "Esc cancel" — one press closes it.
+      { waitScreen: /▸ boom/, send: "\u001b" },
+      { waitScreen: (t) => /^\s*❯\s*$/.test(t.line(t.row)) && !/type to filter/.test(t.text()), send: "\u0003" },
+      { wait: /press Ctrl\+C again to exit/, send: "\u0003" },
+      { wait: /session closed/, send: null },
+    ], { env: { MCP_DEV_CONFIG_DIR: configDir, ANTHROPIC_API_KEY: "" }, timeoutMs: 25_000 });
+
+    assert.equal(code, 0, visible.slice(-2000));
+    assert.match(visible, /press Ctrl\+C again to exit/);
+    assert.match(visible, /session closed/);
+  } finally {
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});

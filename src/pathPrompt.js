@@ -193,6 +193,7 @@ export async function promptPathValue({
       parts.push(colors.path(displayPath(target, { baseDir, width: Math.max(24, terminalColumns() - 24) })));
       return [parts.join("  ")];
     },
+    escapeCancels: true,
     hints: () => ["Tab complete/open", "↑/↓ browse", "Enter accept", "Esc cancel"],
     validate: (text) => {
       if (!String(text).trim()) return "A path is required.";

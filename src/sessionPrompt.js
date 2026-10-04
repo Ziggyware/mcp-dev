@@ -98,6 +98,7 @@ export async function pickOne({ title, message = "❯", items, ctx, allowEmpty =
     title,
     message,
     menuSize: 10,
+    escapeCancels: true,
     status: { text: "↑/↓ choose · Enter select · Esc cancel", tone: "info" },
     completions: (input) => ({ items: rankByFuzzy(items, input, { key: (item) => `${item.label} ${item.description ?? ""}` }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["type to filter", "↑/↓ choose", "Enter select", "Esc cancel"],

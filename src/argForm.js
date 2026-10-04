@@ -119,6 +119,7 @@ async function promptEnumField({ key, schema, isRequired, header, footer }) {
     message: () => `${marks.arrow()} ${style.body(key)}`,
     menuSize: 8,
     footer,
+    escapeCancels: true,
     status: { text: "↑/↓ choose · Enter accept · Esc cancel", tone: "info" },
     completions: (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["↑/↓ choose", "Enter accept", "Shift+Tab back", "Esc cancel"],
@@ -138,6 +139,7 @@ async function promptBooleanField({ key, schema, isRequired, header, footer, def
     message: () => `${marks.arrow()} ${style.body(key)}`,
     menuSize: 4,
     footer,
+    escapeCancels: true,
     status: { text: "↑/↓ choose · Enter accept · Esc cancel", tone: "info" },
     completions: (text) => ({ items: rankByFuzzy(items, text, { key: (item) => item.label }).map(({ item, indices }) => ({ ...item, indices })) }),
     hints: () => ["↑/↓ choose", "Enter accept", "Shift+Tab back", "Esc cancel"],
@@ -203,6 +205,7 @@ async function promptScalarField({ key, schema, isRequired, resultBuffer, header
       resultBuffer?.list().length ? "! cached values" : "",
       "Esc cancel",
     ].filter(Boolean),
+    escapeCancels: true,
     validate: backrefValidate,
     onKey: (event, api) => {
       if (event.name === "enter" && !api.line.text.trim() && !isRequired) {

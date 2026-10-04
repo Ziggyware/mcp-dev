@@ -132,10 +132,12 @@ export async function runWithSpinner(label, task, { listen = true, input = proce
   };
 
   spinner.start(label);
+  let detachConsumer = null;
   if (cancellable) {
     input.setRawMode(true);
     input.resume();
-    input.on("data", onData);
+    if (target) detachConsumer = target.setInputConsumer(onData);
+    else input.on("data", onData);
   }
 
   const started = Date.now();
@@ -157,9 +159,12 @@ export async function runWithSpinner(label, task, { listen = true, input = proce
   } finally {
     externalSignal?.removeEventListener?.("abort", onExternalAbort);
     if (cancellable) {
-      input.off("data", onData);
-      if (!target) input.setRawMode(false);
-      input.pause();
+      if (detachConsumer) { detachConsumer(); detachConsumer = null; }
+      if (!target) {
+        input.off("data", onData);
+        input.setRawMode(false);
+        input.pause();
+      }
       // The screen owns the terminal modes for the whole session; a one-shot
       // call (no screen) has to give bracketed paste / keyboard flags back.
       if (!target) output.write(TERMINAL_MODES.leave);

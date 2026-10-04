@@ -179,6 +179,7 @@ export function runPrompt(options = {}) {
 
   let resolveResult;
   let finished = false;
+  let detachConsumer = null;
   const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
   let flushTimer = null;
   let completionTimer = null;
@@ -816,6 +817,10 @@ export function runPrompt(options = {}) {
     }
 
     if (event.name === "escape") {
+      // Dialogs that advertise "Esc cancel" (pickers, form fields, the JSON
+      // editor) really cancel on Escape from an empty line; the session's main
+      // prompt handles Escape itself.
+      if (options.escapeCancels && !line.text) { cancel(); return; }
       if (line.text) {
         killRing.push(line.text);
         setLine(L.createLine(""));
@@ -1014,7 +1019,11 @@ export function runPrompt(options = {}) {
   function attach() {
     input.setRawMode?.(true);
     input.resume?.();
-    input.on("data", onData);
+    // Inside a session the screen owns the stdin read; registering as its
+    // consumer instead of adding another listener is what keeps keystrokes from
+    // slipping through the gap between two prompts.
+    if (screen) detachConsumer = screen.setInputConsumer(onData);
+    else input.on("data", onData);
     input.on("end", onEnd);
     output.on?.("resize", onResize);
     process.on("SIGINT", onSigint);
@@ -1032,17 +1041,20 @@ export function runPrompt(options = {}) {
   }
 
   function detach() {
+    if (detachConsumer) { detachConsumer(); detachConsumer = null; }
     if (flushTimer) clearTimeout(flushTimer);
     if (completionTimer) clearTimeout(completionTimer);
     if (transientTimer) clearTimeout(transientTimer);
-    input.off?.("data", onData);
+    if (!screen) input.off?.("data", onData);
     input.off?.("end", onEnd);
     output.off?.("resize", onResize);
     process.off("SIGINT", onSigint);
     // The screen keeps raw mode for the whole session; a one-shot prompt gives
     // the tty back to the shell when it finishes.
-    if (!screen) input.setRawMode?.(false);
-    input.pause?.();
+    if (!screen) {
+      input.setRawMode?.(false);
+      input.pause?.();
+    }
     if (!screen) output.write(TERMINAL_MODES.leave);
   }
 

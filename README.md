@@ -135,7 +135,7 @@ Every match in the completion menu says what it will do, previews what Enter wil
 | Ctrl+W, Ctrl+Backspace, Alt+Backspace | Delete the previous word. |
 | Ctrl+U / Ctrl+K | Delete to the start / end of the line; Ctrl+Y restores it. |
 | Ctrl+R | Search history. |
-| Esc | Clear the current line (Ctrl+Y restores it); on an empty line it leaves the prompt. |
+| Esc | Clear the current line (Ctrl+Y restores it); on an empty line it leaves the prompt. In a dialog — a picker, a form field, the JSON editor — it cancels the dialog. |
 | Ctrl+C | Cancel the line or the in-flight call; press it twice in a row to leave the session. |
 | Ctrl+D | Exit on an empty line. |
 | PgUp / PgDn | Scroll the transcript a page. Works in every state, including while a call is running and while a menu is open. |
@@ -350,6 +350,8 @@ The session's input surface was rebuilt around a full-screen transcript. The com
 46. **The screen is used in full.** Status bar on the first row, transcript above the input block, hint line on the last row; the input block is capped at ~60% of the height so a long approval can never swallow the transcript.
 47. **Results are never painted over.** Everything the session prints goes into its own scrollable transcript (stdout and `console.*` are captured while the screen is active), and a result taller than the view opens at its first line.
 48. **Scrollback is real and works everywhere.** PgUp/PgDn, Shift+↑/↓, Ctrl+Home/End, and the wheel scroll the transcript; the status bar shows how far below the view the newest output is.
+49. **Esc does what the dialogs say.** Pickers, form fields, the path browser, and the JSON editor advertise "Esc cancel" and now cancel on Escape from an empty line.
+50. **No keystroke falls into the gap between prompts.** The screen is the session's single stdin reader and hands bytes to whoever is active, so text typed between two prompts is replayed instead of dropped — and a second Ctrl+C always reaches the session.
 
 ## Development
 

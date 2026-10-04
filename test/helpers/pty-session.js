@@ -108,6 +108,12 @@ export function driveSession(script, { env = {}, rows = 30, cols = 100, timeoutM
       // cooked-mode window and SIGINT it.
       const nudge = (attempt) => {
         if (finished || wantsOut()) return;
+        if (attempt >= 5) {
+          // The session is ignoring every polite request; do not leave a hung
+          // child (and a hung test run) behind.
+          child.kill("SIGKILL");
+          return;
+        }
         if (attempt === 0) child.stdin.write("\u001b");       // leave any open dialog
         child.stdin.write("\u0003");                            // cancel the line
         setTimeout(() => {

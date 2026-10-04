@@ -18,6 +18,7 @@
 
 import util from "node:util";
 import { clipText, stripAnsi, visibleWidth } from "./terminal.js";
+import { pushBytes } from "./typeahead.js";
 
 const SYNC_ON = "\x1b[?2026h"; // begin synchronized update (ignored when unsupported)
 const SYNC_OFF = "\x1b[?2026l";
@@ -92,6 +93,11 @@ export class Screen {
     this._captured = null;
     this._onResize = () => this.render();
     this._onExit = () => this.leave();
+    // The screen is the session's single stdin reader: whoever is active (a
+    // prompt, a spinner) registers as the consumer, and bytes that arrive in
+    // the gaps are queued as type-ahead instead of being lost in the handover.
+    this._consumer = null;
+    this._onData = (chunk) => this.onBytes(chunk);
     this._cursorVisible = false;
   }
 
@@ -132,6 +138,8 @@ export class Screen {
     this.input.setRawMode?.(true);
     this._write(`${ALT_ON}\x1b[2J\x1b[H${CURSOR_HIDE}`);
     if (this.mouse) this._write(MOUSE_ON);
+    this.input.resume?.();
+    this.input.on("data", this._onData);
     this.output.on?.("resize", this._onResize);
     this.output.on?.("SIGWINCH", this._onResize);
     process.on?.("exit", this._onExit);
@@ -148,7 +156,12 @@ export class Screen {
     this.output.off?.("resize", this._onResize);
     this.output.off?.("SIGWINCH", this._onResize);
     process.off?.("exit", this._onExit);
+    this.input.off?.("data", this._onData);
+    this._consumer = null;
     this.input.setRawMode?.(false);
+    // Stop reading: a resumed stdin keeps the event loop (and the process)
+    // alive, which would turn "session closed" into a hung terminal.
+    this.input.pause?.();
     this.prompt = null;
   }
 
@@ -204,6 +217,31 @@ export class Screen {
 
   release() {
     this._captured?.();
+  }
+
+  // -------------------------------------------------------------------- input
+
+  /**
+   * Take over stdin bytes until the returned function is called. Only one
+   * consumer can be active (a prompt, or a spinner while a call runs); bytes
+   * arriving with no consumer go to the type-ahead queue for the next prompt.
+   */
+  setInputConsumer(consume) {
+    if (typeof consume !== "function") return () => {};
+    this._consumer = consume;
+    return () => {
+      if (this._consumer === consume) this._consumer = null;
+    };
+  }
+
+  /** Hand a chunk to the active consumer, or queue it as type-ahead. */
+  onBytes(chunk) {
+    const consumer = this._consumer;
+    if (!consumer) {
+      pushBytes(chunk);
+      return;
+    }
+    consumer(chunk);
   }
 
   // ------------------------------------------------------------------ content
