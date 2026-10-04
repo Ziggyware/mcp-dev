@@ -107,27 +107,54 @@ mcp-dev completion zsh > "${fpath[1]}/_mcp-dev"
 
 ## Interactive session
 
-The session has three input modes:
+The session tells you what it accepts, both in the prompt footer and in the `?` overlay:
 
 | Input | Meaning |
 |---|---|
-| Plain text | Chat with the assistant. Requires `ANTHROPIC_API_KEY`. |
-| `/command` | Run a built-in command, such as `/servers`, `/call`, `/refresh`, or `/help`. |
-| `/server/` or `/server/tool` | Lazy-connect, inspect, and select a tool. The legacy `server/tool` spelling also works. |
+| Plain text | Chat with the assistant. Only offered when `ANTHROPIC_API_KEY` is set; direct tool calls never need it. |
+| `/help` or `?` | The full in-session guide: modes, commands, keys, and cached values. |
+| `/command` | Run a built-in command, such as `/servers`, `/call`, `/refresh`, or `/approvals`. |
+| `/server/` | Lazy-connect and browse that server's tools. |
+| `/server/tool` | Open one tool's argument form; append `{"k":"v"}` to prefill it (`/demo/echo {"text":"hi"}`). |
+| `!3`, `!3.path`, `!!` | Reuse a cached result, or a path inside it, as an argument value. |
 | `//message` | Send a chat message that literally begins with `/`. |
 
-`/help` displays the full in-session reference. Direct session calls and model-proposed calls both show an approval screen before execution.
+Every match in the completion menu says what it will do, previews what Enter will run, and shows the recognized parameters. Path fields start in the session's working directory (`/cd`, `/pwd`), show the current directory in the preview, and complete with Tab.
 
 ### Keyboard behavior
 
-Text fields and fuzzy search prompts support word deletion consistently:
+| Key | Action |
+|---|---|
+| Enter | Run the line, accept the highlighted completion, or submit the form field. |
+| Ctrl+Enter / Shift+Enter / Alt+Enter | Insert a newline in the current input. |
+| Tab | Complete the highlighted suggestion; with no suggestion, insert a literal tab. Tab never rewrites the line you typed. |
+| Shift+Tab | Previous suggestion, or the previous form field with its value preserved. |
+| ↑ / ↓ | Move through suggestions, then history. |
+| ← / → | Move the cursor; Ctrl or Alt + ← / → moves by word. Paths, `/server/tool` routes, and `!7.rows[0].name` references count as single words. |
+| Ctrl+A / Ctrl+E | Start / end of the line. |
+| Ctrl+W, Ctrl+Backspace, Alt+Backspace | Delete the previous word. |
+| Ctrl+U / Ctrl+K | Delete to the start / end of the line; Ctrl+Y restores it. |
+| Ctrl+R | Search history. |
+| Esc | Clear the current line (Ctrl+Y restores it); on an empty line it leaves the prompt. |
+| Ctrl+C | Cancel the line or the in-flight call; press it twice in a row to leave the session. |
+| Ctrl+D | Exit on an empty line. |
 
-- **Ctrl+Backspace** — delete the previous word in terminals that report that key combination.
-- **Alt/Option+Backspace** — supported where the terminal maps it to Meta+Backspace.
-- **Ctrl+W** — portable terminal fallback for delete-previous-word.
-- **Ctrl+C** — cancel the active prompt or in-flight MCP request.
+The prompt keeps the terminal in a single raw-mode pipeline (a key decoder, a line-editor model, and an inline frame that repaints only its own rows), so no full-screen alternate buffer is used and the scrollback stays intact.
 
-The implementation normalizes the key event before Node’s readline handler runs, so it avoids the one-character deletion behavior seen in several Windows terminal setups.
+### Approvals, once
+
+Session calls are still explicit, but you only approve once per scope:
+
+```text
+y   run this time
+a   always this tool in this session
+A   always every tool on this server
+*   allow every tool for the rest of the session
+e   edit the arguments and return to the approval screen
+n   skip this call
+```
+
+`/approvals` lists the active grants, `/untrust <tool|server:<name>|all>` revokes one, and `/approvals clear` revokes everything.
 
 ## Configuration
 
@@ -246,7 +273,7 @@ Session results stay in an in-memory ring buffer (20 entries). Use them as subse
 \!123                      literal !123, not a back-reference
 ```
 
-`/results` lists cache indices. `/save` writes one selected result after an overwrite confirmation. The buffer clears when the session exits and is never persisted automatically.
+`/results` lists cache indices. Typing `!` opens a completion menu that enumerates the references that actually exist for each result, with a short type/value preview next to each one — so the cached-value syntax is discoverable without reading this file. `/result <n>[.path]` reprints a cached value (bare `1.path` works too), and `/save <n>[.path] [file]` writes it to disk after an overwrite confirmation. The buffer clears when the session exits and is never persisted automatically.
 
 ## Security
 
@@ -283,6 +310,29 @@ This release implements the following specific changes, rather than relying on a
 18. **Closed the session confirmation gap**: palette and `/call` tool invocations now require the same explicit approval as one-shot calls.
 19. **Fixed agent tool namespace dispatch** so encoded model tool IDs resolve back to the original server/tool names; agent results now enter the result buffer.
 20. **Added safer remote-server controls**: URL redaction, safe list JSON, `${ENV}` headers, opt-in MCP sampling, and bounded server-stderr diagnostics.
+
+## Twenty more improvements (the session UX pass)
+
+21. **Made Tab append instead of splice.** Completing `/demo/ec` writes the completion after what you typed, keeps the cursor at the end, and never produces `Ask: wo` mid-string; a repeated Tab cycles candidates and then inserts a literal tab.
+22. **Made chat opt-in.** Plain text is not the default Enter action, the `Ask` suggestion is hidden when `ANTHROPIC_API_KEY` is unset, and the prompt says why instead of failing later with "api key is not set".
+23. **Added Ctrl+Enter / Shift+Enter / Alt+Enter newline insertion** to the shared key decoder, including the kitty and `modifyOtherKeys` encodings that readline does not decode.
+24. **Added Escape-to-clear and double-Ctrl+C-to-exit**, with a graceful shutdown path (connections closed, history saved, `session closed` message) even when the second press arrives as a real signal.
+25. **Fixed word-wise cursor motion.** Ctrl/Alt+←/→ and Ctrl+Backspace now treat paths, `/server/tool` routes, and `!7.rows[0].name` references as single words and can no longer leave the command text.
+26. **Fixed the "input got stuck" class of bugs**: bytes typed while a call or connection is running are queued and replayed into the next prompt, stdin `end` is treated as Ctrl+D, and an already-ended stdin can no longer park the prompt forever.
+27. **Added a status line** with server/connection/cache/result/grant counts, chat state, and the current directory, plus a footer that always names the keys that work right now.
+28. **Replaced the notepad JSON flow with an inline editor** (`Ctrl+E` toggles it): colourised JSON, line/column error positions with an error pointer, tab indentation, and `!n` references as values.
+29. **Made approvals scoped and memorable** (`y` once, `a` this tool, `A` this server, `*` everything) with `/approvals` and `/untrust <scope>` to review and revoke them, so repeat calls stop asking.
+30. **Added a path prompt that shows where you are**: the current directory in the preview, `Tab` to browse and complete, `~` expansion, and directory-vs-file awareness for path-typed schema fields.
+31. **Added a cached-value completion menu** (`!`) that enumerates real paths with value previews, so `!N` usage is understandable from the UI alone.
+32. **Made every completion item explain itself** — kind (command/server/tool/cache), description, matching parameter hint, and a preview pane showing what Enter will do.
+33. **Gave the argument form a real flow**: required/optional markers, enum and boolean choosers with a skip row, Shift+Tab to step back with values preserved, inline JSON, and a one-line summary of what will be sent.
+34. **Added progress with cancellation** for connects and calls (elapsed-time spinner, Ctrl+C or Esc to abort) instead of a silent block.
+35. **Added a colour system with a single owner** (`src/colors.js`) and `/color auto|always|never|basic` so colour works in any terminal and can be turned off.
+36. **Added an input guide** (`/help`, `/keys`, or `?`) that lists every input mode, key, command, and approval scope inside the session.
+37. **Kept the scrollback clean** with an inline frame that repaints only its own rows, no alternate-screen buffer, and transient status messages that expire instead of piling up.
+38. **Taught the app to recover from cancelled work**: after Esc or Ctrl+C the prompt accepts input immediately, history and pending completions are reset, and a second Ctrl+C exits.
+39. **Added regression coverage for the whole input stack** — key decoding (including private CSI and paste), the line-editor model, fuzzy ranking, the JSON editor, back-reference paths, approvals, router classification and completion, plus a real pty test that drives the session's connect → form → approval → result flow.
+40. **Fixed `npm test` hanging**: bare `node --test` executes every file under `test/`, including the long-running stdio fixture, so the script now targets `test/*.test.js`.
 
 ## Development
 
