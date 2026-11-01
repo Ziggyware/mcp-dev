@@ -57,7 +57,7 @@ export const SESSION_COMMANDS = [
     description: "ask the assistant; it proposes tool calls you can approve",
     usage: "/ask <question>",
     examples: ["/ask which files mention the cache?"],
-    requiresApiKey: true,
+    requiresBrain: true,
   },
   {
     name: "results",

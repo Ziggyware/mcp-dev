@@ -16,6 +16,8 @@ It is designed to make the safe path quick: **every tool call is shown with its 
 - [Connect the local .NET servers](#connect-the-local-net-servers)
 - [Tool metadata cache and startup speed](#tool-metadata-cache-and-startup-speed)
 - [Result reuse](#result-reuse)
+- [The nokey-router brain](#the-nokey-router-brain)
+- [The 20 AI service hooks](#the-20-ai-service-hooks)
 - [Security](#security)
 - [Twenty concrete improvements](#twenty-concrete-improvements)
 - [Development](#development)
@@ -77,7 +79,7 @@ mcp-dev call files read_file --args-file request.json --dry-run
 mcp-dev session
 ```
 
-The session starts without connecting to every server. Type `/files/` to lazy-connect and browse a server, or type a normal sentence to chat after setting `ANTHROPIC_API_KEY`.
+The session starts without connecting to every server. Type `/files/` to lazy-connect and browse a server, or type a normal sentence to chat — the agent brain is the nokey-router by default, so chat needs no API key at all (see [The nokey-router brain](#the-nokey-router-brain)).
 
 ## Commands
 
@@ -89,8 +91,9 @@ Run `mcp-dev help <command>` for focused examples, options, and keyboard notes.
 | `unregister <name>` | Remove a registration. Interactive terminals ask first; automation needs `--force`. |
 | `list` | List registrations. `--plain` is script-friendly; `--json` is a redacted safe summary. |
 | `tools <server>` | Show readable parameter schemas. Supports `--json`, `--plain`, and cache-only `--cached`. |
+| `schema <server> <tool>` | Level-3 detail for one call: every parameter and the response shape (`--json` for raw schemas). |
 | `call <server> <tool>` | Guided, schema-validated tool call with confirmation. Supports `--args`, `--args-file`, `--dry-run`, `--json`, and `--no-pager`. |
-| `ask <query...>` | Approval-gated multi-step agent loop using `ANTHROPIC_API_KEY`; use `-s <server>` to restrict it. |
+| `ask <query...>` | Approval-gated agent that drives your MCP services through 20 progressive-disclosure hooks. Brain: nokey-router (zero keys) by default. `-s` restricts the agent to one server. |
 | `session [--warm]` | Persistent interactive workspace. `--warm` eagerly refreshes every registration. |
 | `doctor` | Parallel non-destructive health check. Supports timeout, concurrency, and JSON output. |
 | `completion <shell>` | Generate Bash, Zsh, or PowerShell completion. |
@@ -111,7 +114,7 @@ The session tells you what it accepts, both in the prompt footer and in the `?` 
 
 | Input | Meaning |
 |---|---|
-| Plain text | Chat with the assistant. Only offered when `ANTHROPIC_API_KEY` is set; direct tool calls never need it. |
+| Plain text | Chat with the assistant. The brain is the nokey-router by default (no key needed); direct tool calls never involve it. |
 | `/help` or `?` | The full in-session guide: modes, commands, keys, and cached values. |
 | `/command` | Run a built-in command, such as `/servers`, `/call`, `/refresh`, or `/approvals`. |
 | `/server/` | Lazy-connect and browse that server's tools. |
@@ -279,6 +282,71 @@ Session results stay in an in-memory ring buffer (20 entries). Use them as subse
 
 `/results` lists cache indices. Typing `!` opens a completion menu that enumerates the references that actually exist for each result, with a short type/value preview next to each one — so the cached-value syntax is discoverable without reading this file. `/result <n>[.path]` reprints a cached value (bare `1.path` works too), and `/save <n>[.path] [file]` writes it to disk after an overwrite confirmation. The buffer clears when the session exits and is never persisted automatically.
 
+## The nokey-router brain
+
+`mcp-dev` ships with a first-class integration for the [nokey-router](https://nokey-router.ziggyware.deno.net) — a free, OpenAI-compatible model mesh that needs no API key. It powers `mcp-dev ask` and session chat out of the box, with zero configuration:
+
+```bash
+mcp-dev ask "which of my services can read a PDF?"   # just works
+mcp-dev session                                       # chat is ready immediately
+```
+
+**How the brain is picked** (once per command or session):
+
+| Situation | Brain |
+|---|---|
+| Nothing set | nokey-router (`free:smart`) |
+| `ANTHROPIC_API_KEY` set | Anthropic (`claude-sonnet-4-6`, override with `MCP_DEV_MODEL`) |
+| `MCP_DEV_BRAIN=nokey` | force the nokey-router |
+| `MCP_DEV_BRAIN=anthropic` | force Anthropic (errors if the key is missing) |
+| `--brain <name>` / any provider key set | any OpenAI-compatible provider from the fallback chain |
+
+Environment knobs: `NOKEY_ROUTER_URL` (alternate deployment), `NOKEY_ROUTER_MODEL` (routed model: `free:auto`, `free:fast`, `free:smart`, `free:code`, `free:reasoning`), `NOKEY_ROUTER_API_KEY` (only if your deployment enforces the router key; otherwise the literal `nokey` is sent), and `MCP_DEV_BRAIN_TIMEOUT_MS` (per-request bound, default 120000). Transport-level failures (dropped sockets, refused connections) are retried once; HTTP errors and user cancellations are not re-sent. `mcp-dev ask` ends with a one-line audit of what the agent did (hook calls and approved executions). The same router also joins the OpenAI-compatible fallback chain used for background work such as history compression, and `/health` on the router is used for nothing — the CLI never sends your tool data anywhere except to the brain you selected.
+
+The agent loop for OpenAI-compatible brains speaks the router's wire protocol directly (streaming SSE, tool-call deltas, `role:"tool"` results) and degrades gracefully to a single JSON response for routers that ignore `stream:true`.
+
+## The 20 AI service hooks
+
+Dumping every registered tool with its full JSON schema into the model's context does not scale and is poor etiquette: it burns tokens, buries the useful call, and slows every turn. `mcp-dev` instead gives the AI **progressive disclosure** — the same L1 → L2 → L3 zoom the human commands provide:
+
+1. **Level 1 — `mcp_services`**: every MCP service by name (with a one-line purpose and call count).
+2. **Level 2 — `mcp_tools {service}`**: every call of one service — name, purpose, parameter names, no schemas.
+3. **Level 3 — `mcp_schema {service, call}`**: the full contract — every parameter (type, required, default, constraints) and the response shape (`outputSchema` when declared, the MCP content envelope when not).
+
+Then it executes. This is the modern pattern (deferred tools / tool search), and it is implemented with best judgment as proper etiquette: **disclose the least detail that answers the question; never guess a parameter name; always approve before execution.** Two etiquette rules are structural, not suggestions:
+
+- **Level 1 is free.** With a tool cache available (sessions hydrate it; `ask` reads the persistent metadata cache), `mcp_services` never opens a connection just to count — unloaded services are labelled as such, and `mcp_search` / `mcp_suggest` / `mcp_plan` are cached-first too (`mcp_search` accepts `live:true` to force fresh discovery).
+- **Approval is a separate, earlier gate than execution.** Arguments are schema-validated *before* the user is asked, invalid calls never reach an approval prompt, and a declined call is reported to the model as final.
+
+The legacy dump-everything exposure still exists via `mcp-dev ask --expose-tools` or `MCP_DEV_AGENT_MODE=direct`.
+
+The complete hook toolkit, exposed to the AI as tools:
+
+| # | Hook | Kind | What it does |
+|---|---|---|---|
+| 1 | `mcp_services` | L1 | List every MCP service by name. |
+| 2 | `mcp_tools` | L2 | List all calls of a specific service. |
+| 3 | `mcp_schema` | L3 | All parameters + the response contract of one call. |
+| 4 | `mcp_call` | execute | Run any call on any service — approval-gated, schema-validated first. |
+| 5 | `mcp_batch` | execute | Up to 10 calls in one pass, each individually approved; optional concurrent execution (`parallel`). |
+| 6 | `mcp_search` | assist | Fuzzy-search every call across all services by name/purpose/params (cached-first; `live:true` forces fresh discovery). |
+| 7 | `mcp_suggest` | assist | Goal → ranked candidate calls with relevance and match reasons. |
+| 8 | `mcp_describe` | assist | Plain-language briefing: parameter table, defaults, risk notes. |
+| 9 | `mcp_validate` | assist | Dry-run argument validation against the schema — no execution. |
+| 10 | `mcp_draft` | assist | Synthesize a schema-valid argument skeleton (defaults/enums/examples filled). |
+| 11 | `mcp_examples` | assist | Minimal + typical example invocations of a call. |
+| 12 | `mcp_plan` | assist | Turn a goal into an ordered multi-service plan skeleton. |
+| 13 | `mcp_results` | assist | List/read cached results so outputs are reused, not re-fetched. |
+| 14 | `mcp_history` | assist | Journal of what the agent already executed, with outcomes and durations. |
+| 15 | `mcp_explain` | assist | Dissect a cached result: structure, notable fields, reuse references. |
+| 16 | `mcp_health` | assist | Reachability, call counts, and latency for every service. |
+| 17 | `mcp_refresh` | assist | Force re-discovery and report added/removed calls. |
+| 18 | `mcp_resources` | assist | List the MCP resources a service exposes. |
+| 19 | `mcp_read` | assist | Read one resource by URI (bounded). |
+| 20 | `mcp_prompts` | assist | List and render MCP prompt templates. |
+
+Two invariants are enforced in code, not prose: **every execution path goes through the same approval gate as a human-typed call** (hooks cannot bypass it — a declined call is never executed), and **arguments are schema-validated before an approval is ever requested**. Chat in a session, `ask` in a terminal, one-shot or batched — the gate is identical.
+
 ## Security
 
 - Every MCP tool invocation requires an explicit confirmation, including agent and session calls.
@@ -289,6 +357,7 @@ Session results stay in an in-memory ring buffer (20 entries). Use them as subse
 - Server-initiated sampling is not advertised unless `allowSampling` is explicitly enabled for that server.
 - Server stderr is captured in a bounded buffer and surfaced on startup failure, making broken stdio registrations diagnosable without flooding output.
 - `--dry-run` validates and prints a tool request without invoking it; there is deliberately no `--yes` / auto-approve execution flag.
+- Agent hooks inherit every guard: progressive disclosure only changes what the model *sees*, never what it may *execute* without approval. Chat text goes to the selected brain (the nokey-router by default); tool data goes only to your registered services.
 
 ## Twenty concrete improvements
 

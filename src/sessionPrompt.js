@@ -25,7 +25,7 @@ export function statusLine(ctx) {
   if (cached) parts.push(colors.faint(`${cached} cached`));
   if (ctx.resultBuffer?.list().length) parts.push(style.warning(`${ctx.resultBuffer.list().length} results`));
   if (ctx.approvals?.size) parts.push(colors.warning(`${ctx.approvals.size} auto-approve`));
-  parts.push(ctx.apiKey ? colors.success("chat ready") : colors.faint("chat off"));
+  parts.push(ctx.brain ? colors.success(`chat ready · ${ctx.brain.label}`) : colors.faint("chat off"));
   parts.push(colors.path(ctx.cwd ?? process.cwd()));
   return `  ${parts.join(colors.faint(" · "))}`;
 }
@@ -119,7 +119,7 @@ export function helpOverlayLines(ctx, state = {}) {
   lines.push(style.heading("mcp-dev session — input guide"));
   lines.push("");
   lines.push(style.subheading("What you can type"));
-  lines.push(`  ${style.toolName("plain text".padEnd(22))}${colors.faint(ctx.apiKey ? "chat with the assistant (tools require approval)" : "chat needs ANTHROPIC_API_KEY")}`);
+  lines.push(`  ${style.toolName("plain text".padEnd(22))}${colors.faint(ctx.brain ? "chat with the assistant (tools require approval)" : "chat needs an agent brain (MCP_DEV_BRAIN)")}`);
   lines.push(`  ${style.toolName("/command".padEnd(22))}${colors.faint("run a session command, e.g. /servers, /call, /cd")}`);
   lines.push(`  ${style.toolName("/server/".padEnd(22))}${colors.faint("connect on demand and pick one of its tools")}`);
   lines.push(`  ${style.toolName("/server/tool".padEnd(22))}${colors.faint("open a tool directly; add {\"k\":\"v\"} for inline args")}`);

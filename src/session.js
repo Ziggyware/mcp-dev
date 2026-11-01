@@ -19,6 +19,8 @@ import {
   withTimeout,
 } from "./mcpClient.js";
 import { CANCELLED, promptForArgs, runAgentTurn } from "./suggest.js";
+import { createMcpHooks, HOOK_PREAMBLE } from "./agentHooks.js";
+import { describeBrain, selectBrain } from "./brain.js";
 import { ResultBuffer, walkPath } from "./resultBuffer.js";
 import { formatParamHint } from "./palette.js";
 import { compressIfNeeded } from "./history.js";
@@ -202,19 +204,80 @@ async function openTool({ server, tool, presetArgs = null, ctx }) {
 
 // ----------------------------------------------------------------------- chat
 
-function chatUnavailable() {
-  console.log(style.warning("Chat is off: ANTHROPIC_API_KEY is not set in this shell."));
+function chatUnavailable(reason = null) {
+  console.log(style.warning(`Chat is off${reason ? `: ${reason}` : ": no agent brain is available"}.`));
   console.log(colors.faint("  Everything else works without it:"));
   console.log(`    ${style.toolName("/servers")}            list servers            ${colors.faint("(then /call)")}`);
   console.log(`    ${style.toolName("/<server>/")}          connect and pick a tool`);
   console.log(`    ${style.toolName("/call")}               guided argument form`);
-  console.log(colors.faint("  To enable chat: export ANTHROPIC_API_KEY=… and restart `mcp-dev session`."));
+  console.log(colors.faint("  Chat normally runs through the nokey-router with zero keys; force one with MCP_DEV_BRAIN=nokey|anthropic."));
+}
+
+function agentExposure() {
+  return (process.env.MCP_DEV_AGENT_MODE ?? "").toLowerCase() === "direct" ? "direct" : "hooks";
+}
+
+/** One lazily-connected client handle for resources/prompts. */
+async function withClient(ctx, server, action) {
+  const entry = getServer(server);
+  if (!entry) throw new Error(`No server named "${server}".`);
+  const client = await getOrConnectServer(server, entry, { timeoutMs: DISCOVERY_TIMEOUT_MS });
+  return withTimeout(action(client), DISCOVERY_TIMEOUT_MS, `${server} did not answer in time`);
+}
+
+/**
+ * The AI-facing MCP service layer for this session: 20 progressive-disclosure
+ * hooks over every registered server, wired to lazy connects, the approval
+ * store, the result buffer, and a call journal.
+ */
+function buildHookSet(ctx) {
+  return createMcpHooks({
+    servers: () => listServers(),
+    // No-connect cache for level 1 / search / suggest / plan.
+    peekTools: async (name) => ctx.toolCache.get(name) ?? null,
+    ensureTools: async (name) => {
+      const tools = await ensureLiveTools(name, ctx);
+      if (!tools) throw new Error(`"${name}" could not be connected or its calls listed.`);
+      return tools;
+    },
+    refresh: async (name) => {
+      const tools = await refreshServer(name, ctx, { quiet: true });
+      if (!tools) throw new Error(`"${name}" could not be refreshed.`);
+      return tools;
+    },
+    callToolFn: async (server, tool, args, { signal } = {}) => {
+      const entry = getServer(server);
+      if (!entry) throw new Error(`No server named "${server}".`);
+      const outcome = await runWithSpinner(
+        `model → ${style.serverName(server)}/${style.toolName(tool)}`,
+        ({ signal: innerSignal }) => callToolResilient(server, entry, tool, args, {
+          signal: innerSignal ?? signal,
+          timeout: TOOL_TIMEOUT_MS,
+          maxTotalTimeout: TOOL_TIMEOUT_MS,
+        }),
+        { listen: true }
+      );
+      if (!outcome.ok) throw outcome.error ?? new Error("Tool call cancelled");
+      return outcome.value;
+    },
+    confirm: async (server, tool, args) => {
+      const approval = await approveToolCall({ server, tool, args, approvals: ctx.approvals, screen: ctx.screen });
+      return Boolean(approval.approved);
+    },
+    resultBuffer: ctx.resultBuffer,
+    callLog: ctx.agentLog,
+    history: () => ctx.messages,
+    listResources: (server) => withClient(ctx, server, (client) => client.listResources()),
+    readResource: (server, uri) => withClient(ctx, server, (client) => client.readResource({ uri })),
+    listPrompts: (server) => withClient(ctx, server, (client) => client.listPrompts()),
+    getPrompt: (server, prompt, args) => withClient(ctx, server, (client) => client.getPrompt({ name: prompt, arguments: args })),
+  });
 }
 
 async function handleChat(text, ctx) {
   if (!String(text ?? "").trim()) return;
-  if (!ctx.apiKey) {
-    chatUnavailable();
+  if (!ctx.brain) {
+    chatUnavailable(ctx.brainError);
     return;
   }
   const messages = ctx.messages;
@@ -224,15 +287,12 @@ async function handleChat(text, ctx) {
   messages.length = 0;
   messages.push(...compressed);
 
-  const tools = [...ctx.toolCache.entries()]
-    .flatMap(([server, serverTools]) => serverTools.map((tool) => ({ ...tool, __server: server })))
-    .sort((a, b) => a.__server.localeCompare(b.__server) || a.name.localeCompare(b.name, undefined, { numeric: true }));
-
-  const result = await runAgentTurn({
+  const exposure = agentExposure();
+  const shared = {
     messages,
-    tools,
-    apiKey: ctx.apiKey,
+    brain: ctx.brain,
     userQuery: null,
+    system: exposure === "hooks" ? HOOK_PREAMBLE : null,
     confirmTool: async (server, tool, args) => {
       const approval = await approveToolCall({ server, tool, args, approvals: ctx.approvals, screen: ctx.screen });
       return Boolean(approval.approved);
@@ -256,7 +316,16 @@ async function handleChat(text, ctx) {
       const index = ctx.resultBuffer.push({ server, tool, args, mcpResult });
       console.log(colors.faint(`  cached as #${index} (from the model)`));
     },
-  });
+  };
+
+  const result = exposure === "hooks"
+    ? await runAgentTurn({ ...shared, hookSet: buildHookSet(ctx) })
+    : await runAgentTurn({
+        ...shared,
+        tools: [...ctx.toolCache.entries()]
+          .flatMap(([server, serverTools]) => serverTools.map((tool) => ({ ...tool, __server: server })))
+          .sort((a, b) => a.__server.localeCompare(b.__server) || a.name.localeCompare(b.name, undefined, { numeric: true })),
+      });
   if (result.text.startsWith("[stopped after")) console.log(style.warning(result.text));
 }
 
@@ -537,8 +606,8 @@ async function dispatchCommand(route, ctx) {
       return;
     }
     case "ask": {
-      if (!ctx.apiKey) {
-        chatUnavailable();
+      if (!ctx.brain) {
+        chatUnavailable(ctx.brainError);
         return;
       }
       let question = args.join(" ").trim();
@@ -792,7 +861,11 @@ function greeting(ctx) {
   lines.push(`  ${style.toolName("/servers")}          list servers, then ${style.toolName("/call")} for a guided tool call`);
   lines.push(`  ${style.toolName("/<server>/")}         connect and browse one server's tools`);
   lines.push(`  ${style.toolName("!3")}                reuse a cached result ${colors.faint("(/results lists them)")}`);
-  if (!ctx.apiKey) lines.push(`  ${colors.faint("chat is off until ANTHROPIC_API_KEY is set — direct tool calls work now")}`);
+  if (ctx.brain) {
+    lines.push(colors.faint(`  chat is ready via ${describeBrain(ctx.brain)} — the assistant can drive MCP services (calls need approval)`));
+  } else {
+    lines.push(`  ${colors.faint("chat is unavailable in this shell — direct tool calls always work")}`);
+  }
   return lines.join("\n");
 }
 
@@ -806,8 +879,17 @@ export async function startSession({ warm = false } = {}) {
   const screen = new Screen({ input: process.stdin, output: process.stdout });
   screen.enter();
   screen.capture();
+  let brain = null;
+  let brainError = null;
+  try {
+    brain = selectBrain();
+  } catch (error) {
+    brainError = error.message;
+  }
   const ctx = {
-    apiKey: process.env.ANTHROPIC_API_KEY,
+    brain,
+    brainError,
+    agentLog: [],
     messages: [],
     toolCache: new Map(),
     cacheOrigin: new Map(),

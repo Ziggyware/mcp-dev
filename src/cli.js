@@ -415,57 +415,176 @@ export async function runCli(argv = process.argv) {
 
   program
     .command("ask <query...>")
-    .description("Ask an approval-gated agent to use server tools")
+    .description("Ask an approval-gated agent to use MCP services (nokey-router brain by default)")
     .option("-s, --server <name>", "restrict to one server")
+    .option("--brain <name>", "agent brain: nokey (default when no key), anthropic, or a provider name")
+    .option("--expose-tools", "legacy exposure: dump every tool schema up front instead of progressive disclosure")
     .action(withCleanup(async (queryParts, opts) => {
-      const apiKey = process.env.ANTHROPIC_API_KEY;
-      if (!apiKey) throw new Error("Set ANTHROPIC_API_KEY to use `ask`. Use `mcp-dev call` for direct tool prompts.");
-      const [{ getServer, listServers }, { callTool, closeAllClients, connectServerWithRetry, listTools, withTimeout }, { runAgentTurn }] = await Promise.all([
+      const [{ selectBrain }, { getServer, listServers }, { callTool, closeAllClients, connectServerWithRetry, getOrConnectServer, listTools, withTimeout }, { runAgentTurn }, { createMcpHooks, HOOK_PREAMBLE }, { ResultBuffer }] = await Promise.all([
+        import("./brain.js"),
         import("./config.js"),
         import("./mcpClient.js"),
         import("./suggest.js"),
+        import("./agentHooks.js"),
+        import("./resultBuffer.js"),
       ]);
+
+      const brain = selectBrain({ ...process.env, ...(opts.brain ? { MCP_DEV_BRAIN: opts.brain } : {}) });
       const registered = opts.server ? { [opts.server]: getServer(opts.server) } : listServers();
       if (opts.server && !registered[opts.server]) throw new Error(`No server named "${opts.server}".`);
-      const clients = new Map();
-      const failures = [];
-      const allTools = [];
-      try {
-        await Promise.all(Object.entries(registered).map(async ([name, entry]) => {
-          try {
-            const client = await connectServerWithRetry(name, entry, { timeoutMs: DEFAULT_DISCOVERY_TIMEOUT_MS });
-            clients.set(name, client);
-            const tools = await withTimeout(
-              listTools(client, { timeout: DEFAULT_DISCOVERY_TIMEOUT_MS, maxTotalTimeout: DEFAULT_DISCOVERY_TIMEOUT_MS }),
-              DEFAULT_DISCOVERY_TIMEOUT_MS,
-              `Listing tools for "${name}" timed out`
-            );
-            cacheTools(name, entry, tools);
-            allTools.push(...tools.map((tool) => ({ ...tool, __server: name })));
-          } catch (error) {
-            failures.push({ name, message: error.message });
-          }
-        }));
-        if (failures.length) {
-          console.error(style.warning(`Some servers were skipped:\n${failures.sort((a, b) => a.name.localeCompare(b.name)).map((failure) => `  ${failure.name}: ${failure.message}`).join("\n")}`));
+      const legacy = Boolean(opts.exposeTools) || (process.env.MCP_DEV_AGENT_MODE ?? "").toLowerCase() === "direct";
+
+      const discovery = { timeout: DEFAULT_DISCOVERY_TIMEOUT_MS, maxTotalTimeout: DEFAULT_DISCOVERY_TIMEOUT_MS };
+      const ensureConnected = async (name) => {
+        const entry = registered[name] ?? getServer(name);
+        if (!entry) throw new Error(`No server named "${name}".`);
+        return getOrConnectServer(name, entry, { timeoutMs: discovery.timeout });
+      };
+      const listServerTools = async (name, { force = false } = {}) => {
+        const entry = registered[name] ?? getServer(name);
+        if (!entry) throw new Error(`No server named "${name}".`);
+        if (!force) {
+          const cached = getCachedTools(name, entry);
+          if (cached) return cached.tools;
         }
-        if (!allTools.length) throw new Error("No tools are available across registered servers.");
-        allTools.sort((a, b) => a.__server.localeCompare(b.__server) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+        const client = await ensureConnected(name);
+        const tools = await withTimeout(listTools(client, { ...discovery }), discovery.timeout, `Listing tools for "${name}" timed out`);
+        cacheTools(name, entry, tools);
+        return tools;
+      };
+
+      console.log(style.muted(`brain: ${brain.label} · exposure: ${legacy ? "direct tools (legacy)" : "progressive hooks (L1 services → L2 calls → L3 schemas)"} · every execution still requires approval`));
+
+      try {
+        if (legacy) {
+          const clients = new Map();
+          const failures = [];
+          const allTools = [];
+          await Promise.all(Object.entries(registered).map(async ([name, entry]) => {
+            try {
+              const client = await connectServerWithRetry(name, entry, { timeoutMs: discovery.timeout });
+              clients.set(name, client);
+              const tools = await withTimeout(listTools(client, { ...discovery }), discovery.timeout, `Listing tools for "${name}" timed out`);
+              cacheTools(name, entry, tools);
+              allTools.push(...tools.map((tool) => ({ ...tool, __server: name })));
+            } catch (error) {
+              failures.push({ name, message: error.message });
+            }
+          }));
+          if (failures.length) {
+            console.error(style.warning(`Some servers were skipped:\n${failures.sort((a, b) => a.name.localeCompare(b.name)).map((failure) => `  ${failure.name}: ${failure.message}`).join("\n")}`));
+          }
+          if (!allTools.length) throw new Error("No tools are available across registered servers.");
+          allTools.sort((a, b) => a.__server.localeCompare(b.__server) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+          const result = await runAgentTurn({
+            messages: [],
+            tools: allTools,
+            brain,
+            userQuery: queryParts.join(" "),
+            confirmTool: (server, tool, args) => confirmCall(server, tool, args),
+            executeTool: (server, tool, args, { signal } = {}) => callTool(clients.get(server), tool, args, {
+              signal,
+              timeout: DEFAULT_CALL_TIMEOUT_MS,
+              maxTotalTimeout: DEFAULT_CALL_TIMEOUT_MS,
+            }),
+          });
+          if (result.text.startsWith("[stopped after")) console.log(style.warning(result.text));
+          return;
+        }
+
+        const resultBuffer = new ResultBuffer();
+        const callLog = [];
+        const hookSet = createMcpHooks({
+          servers: () => registered,
+          peekTools: async (name) => {
+            const entry = registered[name] ?? getServer(name);
+            if (!entry) return null;
+            return getCachedTools(name, entry, { allowStale: true })?.tools ?? null;
+          },
+          ensureTools: (name) => listServerTools(name),
+          refresh: (name) => listServerTools(name, { force: true }),
+          callToolFn: async (server, tool, args, { signal } = {}) => {
+            const client = await ensureConnected(server);
+            return callTool(client, tool, args, {
+              signal,
+              timeout: DEFAULT_CALL_TIMEOUT_MS,
+              maxTotalTimeout: DEFAULT_CALL_TIMEOUT_MS,
+            });
+          },
+          confirm: (server, tool, args) => confirmCall(server, tool, args),
+          resultBuffer,
+          callLog,
+          listResources: async (server) => (await ensureConnected(server)).listResources(),
+          readResource: async (server, uri) => (await ensureConnected(server)).readResource({ uri }),
+          listPrompts: async (server) => (await ensureConnected(server)).listPrompts(),
+          getPrompt: async (server, prompt, args) => (await ensureConnected(server)).getPrompt({ name: prompt, arguments: args }),
+        });
         const result = await runAgentTurn({
           messages: [],
-          tools: allTools,
-          apiKey,
+          hookSet,
+          brain,
+          system: HOOK_PREAMBLE,
           userQuery: queryParts.join(" "),
-          confirmTool: (server, tool, args) => confirmCall(server, tool, args),
-          executeTool: (server, tool, args, { signal } = {}) => callTool(clients.get(server), tool, args, {
-            signal,
-            timeout: DEFAULT_CALL_TIMEOUT_MS,
-            maxTotalTimeout: DEFAULT_CALL_TIMEOUT_MS,
-          }),
         });
         if (result.text.startsWith("[stopped after")) console.log(style.warning(result.text));
+        const disclosures = callLog.filter((entry) => entry.hook).length;
+        const executions = callLog.filter((entry) => entry.server && entry.ok);
+        if (executions.length) {
+          const executed = [...new Set(executions.map((entry) => `${entry.server}/${entry.tool}`))].join(", ");
+          console.log(style.muted(`agent: ${disclosures} hook call${disclosures === 1 ? "" : "s"} · ${executions.length} approved execution${executions.length === 1 ? "" : "s"} (${executed})`));
+        }
       } finally {
         await closeAllClients();
+      }
+    }));
+
+  program
+    .command("schema <server> <tool>")
+    .description("Level-3 detail for one call: every parameter and the response shape")
+    .option("--json", "print the raw inputSchema/outputSchema as JSON")
+    .action(withCleanup(async (server, toolName, opts) => {
+      const timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS;
+      const [{ getServer }, { closeClient, connectServerWithRetry, listTools, withTimeout }] = await Promise.all([
+        import("./config.js"),
+        import("./mcpClient.js"),
+      ]);
+      const entry = getServer(server);
+      if (!entry) throw new Error(`No server named "${server}". Run \`mcp-dev list\`.`);
+      let client;
+      try {
+        client = await connectServerWithRetry(server, entry, { timeoutMs });
+        const tools = await withTimeout(
+          listTools(client, { timeout: timeoutMs, maxTotalTimeout: timeoutMs }),
+          timeoutMs,
+          `Tool discovery for "${server}" timed out`
+        );
+        cacheTools(server, entry, tools);
+        const tool = tools.find((item) => item.name === toolName);
+        if (!tool) throw new Error(`No tool "${toolName}" on "${server}". Run \`mcp-dev tools ${server}\`.`);
+        if (opts.json) {
+          console.log(JSON.stringify({ server, tool: tool.name, description: tool.description ?? null, inputSchema: tool.inputSchema ?? null, outputSchema: tool.outputSchema ?? null }, null, 2));
+          return;
+        }
+        const schema = tool.inputSchema ?? {};
+        const params = Object.keys(schema.properties ?? {});
+        const required = schema.required ?? [];
+        const lines = [`${style.heading(`${server}/${tool.name}`)}${tool.description ? style.muted(` — ${tool.description}`) : ""}`, ""];
+        if (params.length) {
+          lines.push(style.heading(`Parameters (required: ${required.length ? required.join(", ") : "none"})`));
+          lines.push(JSON.stringify(schema, null, 2));
+        } else {
+          lines.push(style.muted("Parameters: none — call with an empty object {}."));
+        }
+        if (tool.outputSchema && typeof tool.outputSchema === "object") {
+          lines.push("", style.heading("Response schema (outputSchema)"));
+          lines.push(JSON.stringify(tool.outputSchema, null, 2));
+        } else {
+          lines.push("", style.muted("Response: no outputSchema declared. MCP results arrive as a content envelope:"));
+          lines.push(style.muted('  { "content": [ { "type": "text", "text": … }, … ], "isError"?: true }'));
+        }
+        console.log(lines.join("\n"));
+      } finally {
+        await closeClient(client).catch(() => {});
       }
     }));
 
