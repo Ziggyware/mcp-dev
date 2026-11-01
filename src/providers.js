@@ -8,12 +8,11 @@
 
 const DEFAULT_NOKEY_URL = "https://nokey-router.ziggyware.deno.net/v1";
 
-/** Resolve the bearer token for a provider: env key first, then default. */
-export function providerKey(provider) {
-  return process.env[provider.keyEnv] ?? provider.defaultKey;
-}
-
-export function getProviderArray() {
+/**
+ * Every known OpenAI-compatible endpoint, regardless of key availability.
+ * getProviderArray() filters this to the usable subset.
+ */
+export function getProviderCatalog() {
   return [
     {
       name: "nokey_router",
@@ -37,12 +36,25 @@ export function getProviderArray() {
     { name: "huggingface", base: "https://router.huggingface.co/v1", keyEnv: "HF_TOKEN", fallbackModel: "meta-llama/Llama-3.1-8B-Instruct", priority: -5 },
     { name: "siliconflow", base: "https://api.siliconflow.cn/v1", keyEnv: "SILICONFLOW_API_KEY", fallbackModel: "Qwen/Qwen3-8B", priority: -3 },
     { name: "zai", base: "https://open.bigmodel.cn/api/paas/v4", keyEnv: "ZAI_API_KEY", fallbackModel: "GLM-4.7-Flash", priority: -2 },
-  ]
-    .filter((p) => p.alwaysAvailable || process.env[p.keyEnv])
-    .sort((a, b) => a.priority - b.priority);
+  ].sort((a, b) => a.priority - b.priority);
 }
 
-/** Look up one provider by canonical name, e.g. "nokey_router". */
+/** True when a catalog provider can actually be used right now. */
+export function isProviderAvailable(provider) {
+  return Boolean(provider.alwaysAvailable || process.env[provider.keyEnv]);
+}
+
+/** Resolve the bearer token for a provider: env key first, then default. */
+export function providerKey(provider) {
+  return process.env[provider.keyEnv] ?? provider.defaultKey;
+}
+
+/** Available providers only — the chat fallback chain. */
+export function getProviderArray() {
+  return getProviderCatalog().filter(isProviderAvailable);
+}
+
+/** Look up one provider by canonical name from the full catalog. */
 export function resolveProvider(name) {
-  return getProviderArray().find((provider) => provider.name === name) ?? null;
+  return getProviderCatalog().find((provider) => provider.name === name) ?? null;
 }

@@ -301,7 +301,7 @@ mcp-dev session                                       # chat is ready immediatel
 | `MCP_DEV_BRAIN=anthropic` | force Anthropic (errors if the key is missing) |
 | `--brain <name>` / any provider key set | any OpenAI-compatible provider from the fallback chain |
 
-Environment knobs: `NOKEY_ROUTER_URL` (alternate deployment), `NOKEY_ROUTER_MODEL` (routed model: `free:auto`, `free:fast`, `free:smart`, `free:code`, `free:reasoning`), `NOKEY_ROUTER_API_KEY` (only if your deployment enforces the router key; otherwise the literal `nokey` is sent). The same router also joins the OpenAI-compatible fallback chain used for background work such as history compression, and `/health` on the router is used for nothing — the CLI never sends your tool data anywhere except to the brain you selected.
+Environment knobs: `NOKEY_ROUTER_URL` (alternate deployment), `NOKEY_ROUTER_MODEL` (routed model: `free:auto`, `free:fast`, `free:smart`, `free:code`, `free:reasoning`), `NOKEY_ROUTER_API_KEY` (only if your deployment enforces the router key; otherwise the literal `nokey` is sent), and `MCP_DEV_BRAIN_TIMEOUT_MS` (per-request bound, default 120000). Transport-level failures (dropped sockets, refused connections) are retried once; HTTP errors and user cancellations are not re-sent. `mcp-dev ask` ends with a one-line audit of what the agent did (hook calls and approved executions). The same router also joins the OpenAI-compatible fallback chain used for background work such as history compression, and `/health` on the router is used for nothing — the CLI never sends your tool data anywhere except to the brain you selected.
 
 The agent loop for OpenAI-compatible brains speaks the router's wire protocol directly (streaming SSE, tool-call deltas, `role:"tool"` results) and degrades gracefully to a single JSON response for routers that ignore `stream:true`.
 
@@ -313,7 +313,12 @@ Dumping every registered tool with its full JSON schema into the model's context
 2. **Level 2 — `mcp_tools {service}`**: every call of one service — name, purpose, parameter names, no schemas.
 3. **Level 3 — `mcp_schema {service, call}`**: the full contract — every parameter (type, required, default, constraints) and the response shape (`outputSchema` when declared, the MCP content envelope when not).
 
-Then it executes. This is the modern pattern (deferred tools / tool search), and it is implemented with best judgment as proper etiquette: **disclose the least detail that answers the question; never guess a parameter name; always approve before execution.** The legacy dump-everything exposure still exists via `mcp-dev ask --expose-tools` or `MCP_DEV_AGENT_MODE=direct`.
+Then it executes. This is the modern pattern (deferred tools / tool search), and it is implemented with best judgment as proper etiquette: **disclose the least detail that answers the question; never guess a parameter name; always approve before execution.** Two etiquette rules are structural, not suggestions:
+
+- **Level 1 is free.** With a tool cache available (sessions hydrate it; `ask` reads the persistent metadata cache), `mcp_services` never opens a connection just to count — unloaded services are labelled as such, and `mcp_search` / `mcp_suggest` / `mcp_plan` are cached-first too (`mcp_search` accepts `live:true` to force fresh discovery).
+- **Approval is a separate, earlier gate than execution.** Arguments are schema-validated *before* the user is asked, invalid calls never reach an approval prompt, and a declined call is reported to the model as final.
+
+The legacy dump-everything exposure still exists via `mcp-dev ask --expose-tools` or `MCP_DEV_AGENT_MODE=direct`.
 
 The complete hook toolkit, exposed to the AI as tools:
 
@@ -323,8 +328,8 @@ The complete hook toolkit, exposed to the AI as tools:
 | 2 | `mcp_tools` | L2 | List all calls of a specific service. |
 | 3 | `mcp_schema` | L3 | All parameters + the response contract of one call. |
 | 4 | `mcp_call` | execute | Run any call on any service — approval-gated, schema-validated first. |
-| 5 | `mcp_batch` | execute | Up to 10 calls in one pass, each individually approved. |
-| 6 | `mcp_search` | assist | Fuzzy-search every call across all services by name/purpose/params. |
+| 5 | `mcp_batch` | execute | Up to 10 calls in one pass, each individually approved; optional concurrent execution (`parallel`). |
+| 6 | `mcp_search` | assist | Fuzzy-search every call across all services by name/purpose/params (cached-first; `live:true` forces fresh discovery). |
 | 7 | `mcp_suggest` | assist | Goal → ranked candidate calls with relevance and match reasons. |
 | 8 | `mcp_describe` | assist | Plain-language briefing: parameter table, defaults, risk notes. |
 | 9 | `mcp_validate` | assist | Dry-run argument validation against the schema — no execution. |

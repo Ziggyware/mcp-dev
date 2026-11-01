@@ -12,7 +12,7 @@
 //   NOKEY_ROUTER_MODEL=...   pick the routed model (free:auto|fast|smart|code|reasoning)
 //   NOKEY_ROUTER_URL=...     point at a different router deployment
 
-import { getProviderArray, providerKey, resolveProvider } from "./providers.js";
+import { getProviderArray, isProviderAvailable, providerKey, resolveProvider } from "./providers.js";
 
 export const NOKEY_PROVIDER_NAME = "nokey_router";
 
@@ -58,7 +58,10 @@ export function selectBrain(env = process.env) {
   if (forced) {
     const provider = resolveProvider(forced);
     if (!provider) {
-      throw new Error(`MCP_DEV_BRAIN="${forced}" is not a brain. Use "anthropic", "nokey", or a configured provider name.`);
+      throw new Error(`MCP_DEV_BRAIN="${forced}" is not a brain. Use "anthropic", "nokey", or a provider name (groq, mistral, openrouter_free, …).`);
+    }
+    if (!isProviderAvailable(provider)) {
+      throw new Error(`Brain "${forced}" needs ${provider.keyEnv} set in the environment.`);
     }
     return openAiBrainFor(provider);
   }

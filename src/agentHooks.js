@@ -168,6 +168,18 @@ export function createMcpHooks(context) {
     return { server: entry, entry: servers[entry], tools };
   }
 
+  // Cached-first etiquette: when the host exposes a no-connect cache
+  // (context.peekTools), discovery surfaces use it and never open a
+  // connection just to count or search. Without a cache (one-shot contexts)
+  // they fall back to ensureTools, which may connect.
+  async function enumerateTools(name, { live = false } = {}) {
+    if (!live && context.peekTools) {
+      const cached = await context.peekTools(name);
+      if (cached?.length) return { tools: cached, cached: true };
+    }
+    return { tools: (await context.ensureTools(name)) ?? [], cached: false };
+  }
+
   async function resolveTool(service, call) {
     const { server, entry, tools } = await toolsFor(service);
     const tool = tools.find((item) => item.name === String(call ?? "").trim());
@@ -210,14 +222,20 @@ export function createMcpHooks(context) {
       const lines = [`MCP services (${names.length}) — level 1:`, ""];
       for (const name of names) {
         const entry = servers[name];
-        let count = "?";
-        try {
-          const cached = await context.ensureTools(name);
-          count = cached?.length ?? 0;
-        } catch {
-          count = "unreachable";
+        let detail;
+        if (context.peekTools) {
+          // A cache is available: level 1 must stay free — never connect for a count.
+          const cached = await context.peekTools(name);
+          detail = cached ? `${cached.length} calls (cached)` : "not loaded — mcp_tools { service } will load it";
+        } else {
+          try {
+            const tools = await context.ensureTools(name);
+            detail = `${tools?.length ?? 0} calls`;
+          } catch {
+            detail = "unreachable";
+          }
         }
-        lines.push(`  ${name} — ${oneLine(entry.description ?? "no description", 90)} (${count} calls)`);
+        lines.push(`  ${name} — ${oneLine(entry.description ?? "no description", 78)} · ${detail}`);
       }
       lines.push("", "Next: mcp_tools { service } lists one service's calls (level 2).");
       return lines.join("\n");
@@ -339,6 +357,7 @@ export function createMcpHooks(context) {
           },
           description: "ordered calls; earlier outputs are NOT fed into later arguments — use mcp_call for dependent chains",
         },
+        parallel: { type: "boolean", description: "execute approved calls concurrently after all approvals (default: sequential)" },
       },
       required: ["calls"],
       additionalProperties: false,
@@ -349,7 +368,11 @@ export function createMcpHooks(context) {
       if (calls.length > MAX_BATCH_CALLS) {
         return { content: `mcp_batch accepts at most ${MAX_BATCH_CALLS} calls (received ${calls.length}). Split into batches.`, is_error: true };
       }
-      const report = [];
+      // Approvals are always asked sequentially (the user sees one screen at a
+      // time); only execution can be concurrent, and only after every call in
+      // the batch has been individually approved.
+      const report = new Array(calls.length).fill(null);
+      const prepared = [];
       for (const [index, entry] of calls.entries()) {
         const label = `batch[${index}]`;
         try {
@@ -357,22 +380,31 @@ export function createMcpHooks(context) {
           const args = asObject(entry.arguments);
           const validation = validateArguments(resolved.tool.inputSchema, args);
           if (!validation.valid) {
-            report.push(`${label} ${resolved.server}/${resolved.tool.name}: INVALID — ${validation.errors[0] ?? "schema mismatch"} (skipped)`);
+            report[index] = `${label} ${resolved.server}/${resolved.tool.name}: INVALID — ${validation.errors[0] ?? "schema mismatch"} (skipped)`;
             continue;
           }
           const approved = await context.confirm(resolved.server, resolved.tool.name, args);
           if (!approved) {
-            report.push(`${label} ${resolved.server}/${resolved.tool.name}: declined by the user (skipped)`);
+            report[index] = `${label} ${resolved.server}/${resolved.tool.name}: declined by the user (skipped)`;
             continue;
           }
-          const { result } = await executeCall(resolved.server, resolved.tool.name, args, { signal });
-          const text = (result.content ?? []).map((block) => (block.type === "text" ? block.text : JSON.stringify(block))).join("\n");
-          report.push(`${label} ${resolved.server}/${resolved.tool.name}: ${result.isError ? "ERROR — " : "ok — "}${oneLine(text, 400)}`);
+          prepared.push({ index, label, server: resolved.server, tool: resolved.tool, args });
         } catch (error) {
-          report.push(`${label}: ${error.message}`);
+          report[index] = `${label}: ${error.message}`;
         }
       }
-      return { content: clip(`Batch report:\n${report.map((line) => `  ${line}`).join("\n")}`) };
+      const runOne = async (item) => {
+        try {
+          const { result } = await executeCall(item.server, item.tool.name, item.args, { signal });
+          const text = (result.content ?? []).map((block) => (block.type === "text" ? block.text : JSON.stringify(block))).join("\n");
+          report[item.index] = `${item.label} ${item.server}/${item.tool.name}: ${result.isError ? "ERROR — " : "ok — "}${oneLine(text, 400)}`;
+        } catch (error) {
+          report[item.index] = `${item.label} ${item.server}/${item.tool.name}: ${error.message}`;
+        }
+      };
+      if (input.parallel) await Promise.all(prepared.map(runOne));
+      else for (const item of prepared) await runOne(item);
+      return { content: clip(`Batch report:\n${report.map((line) => `  ${line ?? "skipped"}`).join("\n")}`) };
     },
   });
 
@@ -386,6 +418,7 @@ export function createMcpHooks(context) {
       properties: {
         query: { type: "string", description: "keyword, e.g. \"embed\", \"read file\", \"search\"" },
         limit: { type: "integer", description: `max results (default ${Math.min(8, MAX_SEARCH_RESULTS)})` },
+        live: { type: "boolean", description: "force fresh discovery from every service instead of the local cache" },
       },
       required: ["query"],
       additionalProperties: false,
@@ -393,12 +426,18 @@ export function createMcpHooks(context) {
     async handler(input) {
       const query = asName(input.query, "query");
       const limit = Math.min(Number(input.limit) || Math.min(8, MAX_SEARCH_RESULTS), MAX_SEARCH_RESULTS);
+      const live = Boolean(input.live);
       const servers = context.servers();
       const items = [];
+      let cachedHits = 0;
+      let serviceCount = 0;
       for (const name of Object.keys(servers)) {
         let tools = [];
         try {
-          tools = (await context.ensureTools(name)) ?? [];
+          const enumerated = await enumerateTools(name, { live });
+          tools = enumerated.tools;
+          if (enumerated.cached) cachedHits += 1;
+          if (tools.length) serviceCount += 1;
         } catch {
           continue;
         }
@@ -410,10 +449,12 @@ export function createMcpHooks(context) {
           });
         }
       }
-      if (!items.length) return "No calls are discoverable right now (no reachable services).";
+      if (!items.length) {
+        return "No calls are discoverable right now (no reachable or loaded services). Try mcp_services, or ask the user to register one.";
+      }
       const ranked = rankByFuzzy(items, query, { key: "searchText", limit }).map(({ item, score }) => ({ item, score }));
       if (!ranked.length) return `No call matches "${query}". Try broader keywords or mcp_services first.`;
-      const lines = [`Top ${ranked.length} calls for "${query}":`, ""];
+      const lines = [`Top ${ranked.length} of ${items.length} calls on ${serviceCount} service${serviceCount === 1 ? "" : "s"} for "${query}"${live ? " (live)" : cachedHits ? " (cached)" : ""}:`, ""];
       for (const { item, score } of ranked) {
         lines.push(`  ${item.server}/${item.tool.name} — ${oneLine(item.tool.description ?? "", 88)} (score ${score})`);
       }
@@ -440,7 +481,7 @@ export function createMcpHooks(context) {
       for (const name of Object.keys(servers)) {
         let tools = [];
         try {
-          tools = (await context.ensureTools(name)) ?? [];
+          tools = (await enumerateTools(name)).tools;
         } catch {
           continue;
         }
@@ -531,11 +572,7 @@ export function createMcpHooks(context) {
       const args = asObject(input.arguments);
       const validation = validateArguments(tool.inputSchema, args);
       if (validation.valid) {
-        const missing = (tool.inputSchema?.required ?? []).filter((name) => !(name in args));
-        return [
-          `✓ arguments satisfy the schema of ${server}/${tool.name}.`,
-          missing.length ? `Note: required parameters not yet present: ${missing.join(", ")}.` : "Ready for mcp_call.",
-        ].join("\n");
+        return `✓ arguments satisfy the schema of ${server}/${tool.name}. Ready for mcp_call.`;
       }
       return {
         content: clip([
@@ -631,7 +668,7 @@ export function createMcpHooks(context) {
       for (const name of Object.keys(context.servers())) {
         let tools = [];
         try {
-          tools = (await context.ensureTools(name)) ?? [];
+          tools = (await enumerateTools(name)).tools;
         } catch {
           continue;
         }
@@ -769,15 +806,18 @@ export function createMcpHooks(context) {
       const names = Object.keys(servers);
       if (!names.length) return "No MCP services are registered.";
       const lines = ["Service health:", ""];
-      for (const name of names) {
+      // Checked concurrently: one slow or dead service must not stretch the
+      // whole report by its timeout.
+      const outcomes = await Promise.all(names.map(async (name) => {
         const started = Date.now();
         try {
           const tools = await context.ensureTools(name);
-          lines.push(`  ✓ ${name} — ${tools?.length ?? 0} calls, ${Date.now() - started}ms`);
+          return `  ✓ ${name} — ${tools?.length ?? 0} calls, ${Date.now() - started}ms`;
         } catch (error) {
-          lines.push(`  ✗ ${name} — ${oneLine(error.message, 90)}`);
+          return `  ✗ ${name} — ${oneLine(error.message, 90)}`;
         }
-      }
+      }));
+      lines.push(...outcomes);
       return lines.join("\n");
     },
   });

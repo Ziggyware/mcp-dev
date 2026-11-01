@@ -233,6 +233,8 @@ async function withClient(ctx, server, action) {
 function buildHookSet(ctx) {
   return createMcpHooks({
     servers: () => listServers(),
+    // No-connect cache for level 1 / search / suggest / plan.
+    peekTools: async (name) => ctx.toolCache.get(name) ?? null,
     ensureTools: async (name) => {
       const tools = await ensureLiveTools(name, ctx);
       if (!tools) throw new Error(`"${name}" could not be connected or its calls listed.`);

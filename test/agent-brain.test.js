@@ -285,3 +285,79 @@ test("runAgentTurnOpenAI tolerates routers that answer JSON despite stream:true"
     await new Promise((resolve) => jsonServer.close(resolve));
   }
 });
+
+test("selectBrain names the missing env var for a forced-but-unkeyed provider", () => {
+  const saved = process.env.MCP_DEV_BRAIN;
+  const savedGroq = process.env.GROQ_API_KEY;
+  try {
+    delete process.env.GROQ_API_KEY;
+    let threw = null;
+    try {
+      selectBrain({ MCP_DEV_BRAIN: "groq" });
+    } catch (error) {
+      threw = error;
+    }
+    assert.ok(threw, "forcing an unkeyed provider must fail");
+    assert.match(threw.message, /GROQ_API_KEY/);
+  } finally {
+    if (saved === undefined) delete process.env.MCP_DEV_BRAIN;
+    else process.env.MCP_DEV_BRAIN = saved;
+    if (savedGroq !== undefined) process.env.GROQ_API_KEY = savedGroq;
+  }
+});
+
+test("runAgentTurnOpenAI retries once on transport-level failures, not on HTTP errors", async () => {
+  let attempts = 0;
+  const flaky = http.createServer((req, res) => {
+    attempts += 1;
+    if (attempts === 1) {
+      req.resume();
+      res.destroy(); // dropped socket → fetch failed
+      return;
+    }
+    req.resume();
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(sseChunk({ choices: [{ index: 0, delta: { content: "second attempt" } }] }));
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise((resolve) => flaky.listen(0, "127.0.0.1", resolve));
+  try {
+    const result = await runAgentTurnOpenAI({
+      messages: [],
+      toolDefs: [],
+      brain: { kind: "openai", base: `http://127.0.0.1:${flaky.address().port}/v1`, apiKey: "nokey", model: "free:smart" },
+      userQuery: "go",
+      dispatch: async () => ({ content: "" }),
+    });
+    assert.equal(result.text, "second attempt");
+    assert.equal(attempts, 2);
+  } finally {
+    await new Promise((resolve) => flaky.close(resolve));
+  }
+
+  // HTTP errors are answers, not flakes: no retry.
+  let unauthorized = 0;
+  const strict = http.createServer((req, res) => {
+    unauthorized += 1;
+    req.resume();
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "no" } }));
+  });
+  await new Promise((resolve) => strict.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(
+      runAgentTurnOpenAI({
+        messages: [],
+        toolDefs: [],
+        brain: { kind: "openai", base: `http://127.0.0.1:${strict.address().port}/v1`, apiKey: "nokey", model: "free:smart" },
+        userQuery: "go",
+        dispatch: async () => ({ content: "" }),
+      }),
+      /HTTP 401/,
+    );
+    assert.equal(unauthorized, 1);
+  } finally {
+    await new Promise((resolve) => strict.close(resolve));
+  }
+});

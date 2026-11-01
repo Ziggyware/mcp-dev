@@ -496,6 +496,11 @@ export async function runCli(argv = process.argv) {
         const callLog = [];
         const hookSet = createMcpHooks({
           servers: () => registered,
+          peekTools: async (name) => {
+            const entry = registered[name] ?? getServer(name);
+            if (!entry) return null;
+            return getCachedTools(name, entry, { allowStale: true })?.tools ?? null;
+          },
           ensureTools: (name) => listServerTools(name),
           refresh: (name) => listServerTools(name, { force: true }),
           callToolFn: async (server, tool, args, { signal } = {}) => {
@@ -522,6 +527,12 @@ export async function runCli(argv = process.argv) {
           userQuery: queryParts.join(" "),
         });
         if (result.text.startsWith("[stopped after")) console.log(style.warning(result.text));
+        const disclosures = callLog.filter((entry) => entry.hook).length;
+        const executions = callLog.filter((entry) => entry.server && entry.ok);
+        if (executions.length) {
+          const executed = [...new Set(executions.map((entry) => `${entry.server}/${entry.tool}`))].join(", ");
+          console.log(style.muted(`agent: ${disclosures} hook call${disclosures === 1 ? "" : "s"} · ${executions.length} approved execution${executions.length === 1 ? "" : "s"} (${executed})`));
+        }
       } finally {
         await closeAllClients();
       }

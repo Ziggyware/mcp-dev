@@ -11,7 +11,8 @@ import { anthropicToOpenAi, openAiAssistantToAnthropic } from "./wire.js";
 
 export const OPENAI_AGENT_STEPS = 12;
 
-const REQUEST_TIMEOUT_MS = 120_000;
+const REQUEST_TIMEOUT_MS = Number(process.env.MCP_DEV_BRAIN_TIMEOUT_MS) || 120_000;
+const TRANSIENT_ERROR = /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket|network/i;
 
 function toOpenAiToolDefs(defs) {
   return (defs ?? []).map((def) => ({
@@ -150,13 +151,26 @@ export async function runAgentTurnOpenAI({
   while (steps < maxSteps) {
     steps += 1;
     const wireMessages = anthropicToOpenAi(messages, { system });
-    const { message } = await streamChatCompletion({
-      base: brain.base,
-      apiKey: brain.apiKey,
-      model: brain.model,
-      messages: wireMessages,
-      tools: openAiTools,
-    });
+    // One retry for transport-level flakes (dropped sockets, DNS blips).
+    // HTTP errors from the brain are answers, not flakes; timeouts and user
+    // aborts are deliberate and must not be re-sent.
+    let message;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        ({ message } = await streamChatCompletion({
+          base: brain.base,
+          apiKey: brain.apiKey,
+          model: brain.model,
+          messages: wireMessages,
+          tools: openAiTools,
+        }));
+        break;
+      } catch (error) {
+        const transient = attempt === 1 && TRANSIENT_ERROR.test(String(error?.message));
+        if (!transient) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+    }
 
     const blocks = openAiAssistantToAnthropic(message);
     messages.push({ role: "assistant", content: blocks });

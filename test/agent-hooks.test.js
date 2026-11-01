@@ -377,3 +377,81 @@ test("the preamble teaches the L1→L2→L3 protocol", () => {
   assert.match(HOOK_PREAMBLE, /mcp_schema/);
   assert.match(HOOK_PREAMBLE, /approval/);
 });
+
+// ------------------------------------------------------------ cached-first etiquette
+
+test("level 1 with a cache never connects: counts come from peekTools only", async () => {
+  const { context } = makeContext();
+  let connects = 0;
+  const original = context.ensureTools;
+  context.ensureTools = async (name) => {
+    connects += 1;
+    return original(name);
+  };
+  context.peekTools = async (name) => (name === "files" ? SERVICES.files.tools : null);
+  const hookSet = createMcpHooks(context);
+  const out = await hookSet.run("mcp_services", {});
+  assert.equal(connects, 0, "level 1 must not open connections when a cache exists");
+  assert.match(out.content, /files — .*· 2 calls \(cached\)/);
+  assert.match(out.content, /math — .*· not loaded/);
+});
+
+test("mcp_search is cached-first and only connects when asked to go live", async () => {
+  const { context } = makeContext();
+  const connected = new Set();
+  const original = context.ensureTools;
+  context.ensureTools = async (name) => {
+    connected.add(name);
+    return original(name);
+  };
+  context.peekTools = async (name) => (name === "files" ? SERVICES.files.tools : null);
+
+  const hookSet = createMcpHooks(context);
+  const cached = await hookSet.run("mcp_search", { query: "read file" });
+  assert.ok(!connected.has("files"), "a cache hit must not connect");
+  assert.match(cached.content, /files\/read_file/);
+  assert.match(cached.content, /\(cached\)/);
+
+  const live = await hookSet.run("mcp_search", { query: "add numbers", live: true });
+  assert.ok(connected.has("files") && connected.has("math"), "live:true discovers from every service");
+  assert.match(live.content, /math\/add/);
+  assert.match(live.content, /\(live\)/);
+});
+
+test("mcp_search with nothing discoverable says so explicitly", async () => {
+  const { context } = makeContext();
+  context.peekTools = async () => null;
+  context.ensureTools = async () => {
+    throw new Error("unreachable");
+  };
+  const hookSet = createMcpHooks(context);
+  const out = await hookSet.run("mcp_search", { query: "read" });
+  assert.match(out.content, /No calls are discoverable/);
+});
+
+test("mcp_batch parallel mode still approves every call individually", async () => {
+  const { context, calls } = makeContext();
+  const hookSet = createMcpHooks(context);
+  const out = await hookSet.run("mcp_batch", {
+    parallel: true,
+    calls: [
+      { service: "math", call: "add", arguments: { a: 1, b: 2 } },
+      { service: "files", call: "read_file", arguments: { path: "b.txt" } },
+    ],
+  });
+  assert.match(out.content, /math\/add: ok/);
+  assert.match(out.content, /files\/read_file: ok/);
+  assert.equal(calls.filter((entry) => entry.confirm).length, 2, "one approval per call");
+  // Report order follows the request order even when executed concurrently.
+  const addAt = out.content.indexOf("math/add");
+  const readAt = out.content.indexOf("files/read_file");
+  assert.ok(addAt > -1 && readAt > -1);
+});
+
+test("mcp_validate reports readiness without the misleading 'missing required' note", async () => {
+  const { context } = makeContext();
+  const hookSet = createMcpHooks(context);
+  const out = await hookSet.run("mcp_validate", { service: "math", call: "add", arguments: { a: 1, b: 2 } });
+  assert.match(out.content, /Ready for mcp_call/);
+  assert.ok(!/not yet present/.test(out.content));
+});
