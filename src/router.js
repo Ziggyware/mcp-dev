@@ -1,6 +1,6 @@
 // src/router.js — minimal in-process version of routeInference, no circuit
 // breaker / SQLite state.
-import { getProviderArray } from "./providers.js";
+import { getProviderArray, providerKey } from "./providers.js";
 
 // Improvement 9: per-provider request timeout via AbortController. A hung
 // provider connection previously blocked the entire fallback chain
@@ -21,7 +21,7 @@ export async function routeChat(messages, tools, { timeoutMs = PROVIDER_TIMEOUT_
       const res = await fetch(`${p.base}/chat/completions`, {
         method: "POST",
         headers: {
-          "authorization": `Bearer ${process.env[p.keyEnv]}`,
+          "authorization": `Bearer ${providerKey(p)}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({

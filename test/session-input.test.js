@@ -3,7 +3,7 @@ import test from "node:test";
 import { completionsFor, interpretInput, parseCacheRef, previewFor } from "../src/sessionInput.js";
 import { ResultBuffer } from "../src/resultBuffer.js";
 
-function context({ apiKey = false, withTools = true } = {}) {
+function context({ brain = false, withTools = true } = {}) {
   const buffer = new ResultBuffer();
   const tools = [
     { name: "echo", description: "Echo the text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
@@ -14,7 +14,7 @@ function context({ apiKey = false, withTools = true } = {}) {
   return {
     servers: ["demo"],
     toolsByServer,
-    apiKey,
+    brain,
     resultBuffer: buffer,
     cacheOrigin: new Map([["demo", withTools ? "cached" : ""]]),
     connected: new Set(),
@@ -22,19 +22,19 @@ function context({ apiKey = false, withTools = true } = {}) {
   };
 }
 
-test("plain text is chat, but never the default action without an API key", () => {
-  const withoutKey = context({ apiKey: false });
+test("plain text is chat, but never the default action without a brain", () => {
+  const withoutKey = context({ brain: false });
   assert.equal(interpretInput("wo", withoutKey).type, "chat");
   const completions = completionsFor("wo", withoutKey);
   assert.equal(completions.items.some((item) => item.kind === "chat"), false);
-  assert.match(completions.note, /ANTHROPIC_API_KEY/);
+  assert.match(completions.note, /brain/);
   // No chat entry is offered, but the entries that do work still are.
   assert.ok(completions.items.length > 0);
   const wordnet = { ...withoutKey, servers: ["wordnet"], toolsByServer: new Map(), descriptions: { wordnet: "" } };
   assert.ok(completionsFor("wo", wordnet).items.some((item) => item.label === "/wordnet/"));
-  assert.match(previewFor("wo", withoutKey).join("\n"), /ANTHROPIC_API_KEY/);
+  assert.match(previewFor("wo", withoutKey).join("\n"), /brain/);
 
-  const withKey = context({ apiKey: true });
+  const withKey = context({ brain: { kind: "openai", provider: "nokey_router", label: "nokey-router:free:smart" } });
   const chatItems = completionsFor("wo", withKey).items;
   assert.equal(chatItems[0].kind, "chat");
   assert.equal(chatItems[0].complete, false, "the chat line submits the literal text, it is not a completion");
@@ -59,7 +59,7 @@ test("commands, servers, and tools are routed distinctly", () => {
 });
 
 test("completions explain what each match does", () => {
-  const ctx = context({ apiKey: true });
+  const ctx = context({ brain: { kind: "openai", provider: "nokey_router", label: "nokey-router:free:smart" } });
   const commands = completionsFor("/ser", ctx).items;
   assert.equal(commands[0].label, "/servers");
   assert.ok(commands[0].description.includes("connection state"));

@@ -3,7 +3,7 @@
 // remote endpoint. `mcp-dev tools <server>` refreshes that cache.
 
 export const COMMANDS = [
-  "register", "unregister", "list", "tools", "call", "ask", "session", "doctor", "completion", "help",
+  "register", "unregister", "list", "tools", "schema", "call", "ask", "session", "doctor", "completion", "help",
 ];
 
 function bashScript() {
@@ -28,7 +28,7 @@ _mcp_dev_completions() {
   case "$sub" in
     help)
       if [[ $cword -eq 2 ]]; then COMPREPLY=( $(compgen -W "$commands" -- "$cur") ); fi ;;
-    unregister|tools)
+    unregister|tools|schema)
       if [[ $cword -eq 2 ]]; then COMPREPLY=( $(compgen -W "$(_mcp_dev_servers)" -- "$cur") ); fi
       ;;
     call)
@@ -73,7 +73,7 @@ _mcp_dev() {
   case "$sub" in
     help)
       if (( CURRENT == 3 )); then _describe 'command' commands; fi ;;
-    unregister|tools)
+    unregister|tools|schema)
       if (( CURRENT == 3 )); then _describe 'server' servers; fi ;;
     call)
       if (( CURRENT == 3 )); then
@@ -111,7 +111,7 @@ Register-ArgumentCompleter -Native -CommandName mcp-dev -ScriptBlock {
     }
     $sub = $tokens[1]
     if ($sub -eq 'help' -and $tokens.Count -eq 3) { $commands | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object { Result $_ }; return }
-    if (($sub -eq 'unregister' -or $sub -eq 'tools') -and $tokens.Count -eq 3) { Servers | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object { Result $_ }; return }
+    if (($sub -eq 'unregister' -or $sub -eq 'tools' -or $sub -eq 'schema') -and $tokens.Count -eq 3) { Servers | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object { Result $_ }; return }
     if ($sub -eq 'call') {
         if ($tokens.Count -eq 3) { Servers | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object { Result $_ }; return }
         if ($tokens.Count -eq 4) { Tools $tokens[2] | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object { Result $_ }; return }

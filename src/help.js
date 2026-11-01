@@ -57,6 +57,14 @@ export const COMMAND_HELP = {
     ],
     examples: ["mcp-dev tools files", "mcp-dev tools files --plain"],
   },
+  schema: {
+    group: "Discover",
+    usage: "mcp-dev schema <server> <tool> [--json]",
+    summary: "Level-3 detail for one call: every parameter and the response shape.",
+    details: "The human twin of the agent's mcp_schema hook: prints the full input schema, the output schema when the server declares one, and the MCP content envelope when it does not.",
+    options: ["--json                       Emit { server, tool, inputSchema, outputSchema } as JSON"],
+    examples: ["mcp-dev schema files read_file", "mcp-dev schema files read_file --json"],
+  },
   call: {
     group: "Run",
     usage: "mcp-dev call <server> <tool> [options]",
@@ -77,11 +85,15 @@ export const COMMAND_HELP = {
   },
   ask: {
     group: "Run",
-    usage: "mcp-dev ask <query...> [-s <server>]",
-    summary: "Let a model plan a confirmed, multi-step MCP tool sequence.",
-    details: "Requires ANTHROPIC_API_KEY. Every proposed tool invocation is shown and must be allowed individually.",
-    options: ["-s, --server <name>        Restrict the model to one server"],
-    examples: ["mcp-dev ask -s files 'find the largest JSON file'"],
+    usage: "mcp-dev ask <query...> [-s <server>] [--brain <name>] [--expose-tools]",
+    summary: "Let an agent drive your MCP services through approval-gated hooks.",
+    details: "The agent brain is the nokey-router by default (zero keys, OpenAI-compatible); set ANTHROPIC_API_KEY for Anthropic or force one with --brain/MCP_DEV_BRAIN. Tools are exposed progressively: L1 service names, then L2 calls per service, then L3 parameters and responses, then execute. Every execution is still shown and approved. --expose-tools restores the legacy dump-everything exposure.",
+    options: [
+      "-s, --server <name>         Restrict the agent to one server",
+      "--brain <name>              nokey (default), anthropic, or a provider name",
+      "--expose-tools              Legacy mode: give the model every tool schema up front",
+    ],
+    examples: ["mcp-dev ask -s files 'find the largest JSON file'", "mcp-dev ask --brain anthropic 'summarize new notes'"],
   },
   session: {
     group: "Run",

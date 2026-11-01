@@ -111,7 +111,7 @@ function commandItems(needle) {
     label: `/${command.name}`,
     insertText: `/${command.name}`,
     regionStart: 0,
-    description: `${command.description}${command.requiresApiKey ? colors.faint(" (needs ANTHROPIC_API_KEY)") : ""}`,
+    description: `${command.description}${command.requiresBrain ? colors.faint(" (needs an agent brain)") : ""}`,
     kind: "cmd",
     complete: true,
     trailingSpace: true,
@@ -165,13 +165,13 @@ export function completionsFor(text, ctx) {
   const raw = String(text ?? "");
   const trimmed = raw.trim();
   const servers = ctx.servers ?? [];
-  const apiKey = Boolean(ctx.apiKey);
+  const chatReady = Boolean(ctx.brain);
   const items = [];
 
   if (!trimmed) {
     items.push(...commandItems("").slice(0, 6));
     items.push(...serverItems(servers, ctx, ""));
-    if (apiKey) {
+    if (chatReady) {
       items.push({
         label: "type a sentence to chat",
         insertText: "",
@@ -180,7 +180,7 @@ export function completionsFor(text, ctx) {
         complete: false,
       });
     }
-    return { items: items.slice(0, 12), note: apiKey ? null : "ANTHROPIC_API_KEY is not set — chat and /ask are unavailable, everything else works" };
+    return { items: items.slice(0, 12), note: chatReady ? null : "no agent brain — chat and /ask are unavailable, everything else works" };
   }
 
   if (trimmed.startsWith("!")) {
@@ -266,12 +266,12 @@ export function completionsFor(text, ctx) {
     ...commandItems(trimmed).filter((item) => fuzzyMatch(trimmed, item.command.name)),
     ...serverItems(servers, ctx, trimmed),
   ].slice(0, 4);
-  if (!apiKey) {
+  if (!chatReady) {
     // Chat is not the default action when it cannot run: offer the entries that
     // do work, and say why the sentence itself is inert.
     return {
       items: matches.length ? matches : commandItems("").slice(0, 4),
-      note: "chat is off without ANTHROPIC_API_KEY — Enter will explain how to enable it",
+      note: "chat is unavailable (no agent brain) — Enter will explain; direct tool calls still work",
     };
   }
   const chat = {
@@ -294,11 +294,11 @@ export function previewFor(text, ctx) {
   const route = interpretInput(trimmed, ctx);
 
   if (route.type === "chat") {
-    return ctx.apiKey
-      ? [`${marks.info()} ${colors.faint("chat")} ${style.body(route.message)}`]
+    return ctx.brain
+      ? [`${marks.info()} ${colors.faint(`chat via ${ctx.brain.label}`)} ${style.body(route.message)}`]
       : [
-        `${marks.warn()} ${colors.warning("ANTHROPIC_API_KEY is not set")}`,
-        colors.faint("Set it and restart the session to chat. Direct tool calls work now:"),
+        `${marks.warn()} ${colors.warning("no agent brain is available")}`,
+        colors.faint("Chat normally runs through the nokey-router with zero keys. Direct tool calls work now:"),
         colors.faint(`  /${ctx.servers?.[0] ?? "server"}/  or  /call`),
       ];
   }
@@ -307,7 +307,7 @@ export function previewFor(text, ctx) {
     if (route.command.usage) lines.push(colors.faint(`  usage: ${route.command.usage}`));
     if (route.command.examples?.length) lines.push(colors.faint(`  e.g.  ${route.command.examples[0]}`));
     if (route.command.keys?.length) lines.push(colors.faint(`  shortcut: ${route.command.keys.join(" · ")}`));
-    if (route.command.requiresApiKey && !ctx.apiKey) lines.push(`${marks.warn()} ${colors.warning("requires ANTHROPIC_API_KEY")}`);
+    if (route.command.requiresBrain && !ctx.brain) lines.push(`${marks.warn()} ${colors.warning("requires an agent brain (MCP_DEV_BRAIN)")}`);
     return lines;
   }
   if (route.type === "server") {
