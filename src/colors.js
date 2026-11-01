@@ -1,5 +1,7 @@
 // src/colors.js
-// Unified palette for every renderer (session UI, markdown, render, help).
+// Unified, high-contrast palette for every renderer (session UI, markdown,
+// render, help). Keep secondary text readable on the common dark terminal
+// background: avoid xterm's near-black 238/244 grays and dim-video SGR.
 //
 // Colour state is evaluated on every call rather than at import time so the
 // session's `/color` command can switch modes live without reloading modules.
@@ -53,29 +55,31 @@ function pick(basicCode, basicClose, code256) {
 
 export const colors = {
   bold: wrapAttr(1),
-  dim: pick(2, 22, 244),
-  faint: wrap256(238),
+  // Use actual medium-light foregrounds instead of dim-video, which many
+  // terminal themes render too dark to read against a black background.
+  dim: pick(37, 39, 245),
+  faint: pick(37, 39, 245),
   italic: wrapAttr(3),
   underline: wrapAttr(4),
   inverse: wrapAttr(7),
 
-  body: (s) => (mode === "basic" ? String(s) : wrap256(250)(s)),
+  body: (s) => (mode === "basic" ? String(s) : wrap256(252)(s)),
 
-  red: pick(31, 39, 167),
-  green: pick(32, 39, 108),
-  yellow: pick(33, 39, 180),
-  blue: pick(34, 39, 67),
-  magenta: pick(35, 39, 141),
-  cyan: pick(36, 39, 109),
-  gray: pick(90, 39, 244),
+  red: pick(91, 39, 203),
+  green: pick(92, 39, 114),
+  yellow: pick(93, 39, 220),
+  blue: pick(94, 39, 75),
+  magenta: pick(95, 39, 177),
+  cyan: pick(96, 39, 81),
+  gray: pick(37, 39, 250),
 
-  accent: pick(36, 39, 109),
-  secondary: pick(34, 39, 67),
-  identifier: pick(33, 39, 180),
-  success: pick(32, 39, 108),
-  warning: pick(33, 39, 174),
-  error: pick(31, 39, 167),
-  emphasis: pick(35, 39, 141),
+  accent: pick(96, 39, 81),
+  secondary: pick(94, 39, 75),
+  identifier: pick(93, 39, 221),
+  success: pick(92, 39, 114),
+  warning: pick(93, 39, 220),
+  error: pick(91, 39, 203),
+  emphasis: pick(95, 39, 177),
 };
 
 // Aliases used across the session UI.
